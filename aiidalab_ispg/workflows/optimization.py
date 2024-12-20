@@ -11,11 +11,13 @@ from aiida.plugins import DataFactory, WorkflowFactory
 
 from .utils import extract_trajectory_arrays, structures_to_trajectory
 
+from aiida_orca.workchains import OrcaBaseWorkChain
+
 StructureData = DataFactory("core.structure")
 TrajectoryData = DataFactory("core.array.trajectory")
 Code = DataFactory("core.code.installed")
 
-OrcaBaseWorkChain = WorkflowFactory("orca.base")
+#OrcaBaseWorkChain = WorkflowFactory("orca.base")
 
 __all__ = [
     "RobustOptimizationWorkChain",

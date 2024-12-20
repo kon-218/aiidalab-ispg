@@ -59,7 +59,7 @@ DEFAULT_ATMOSPEC_PARAMETERS = AtmospecParameters(
     tddft_functional="wB97X-D4",
     nwigner=0,
     wigner_low_freq_thr=100.0,
-    rep_sampling=False,
+    rep_sampling=True,
     num_cycles=1200,
     num_samples=10,
     exploratory_method="ZIndo/S",
@@ -134,6 +134,7 @@ class SubmitAtmospecAppWorkChainStep(SubmitWorkChainStepBase):
         if self.codes_selector.orca.value is None:
             return False
         return True
+        
 
     def _wigner_allowed(self):
         # Do not allow Wigner sampling for EOM-CCSD
@@ -216,6 +217,7 @@ class SubmitAtmospecAppWorkChainStep(SubmitWorkChainStepBase):
 
     def _get_parameters_from_ui(self) -> AtmospecParameters:
         """Prepare builder parameters from the UI input widgets"""
+        print(self.repsample_settings.enable_rep_sampling.value)
         return AtmospecParameters(
             optimize=self.geometry_settings.optimize.value,
             charge=self.molecule_settings.charge.value,
@@ -398,6 +400,7 @@ class SubmitAtmospecAppWorkChainStep(SubmitWorkChainStepBase):
             raise NotImplementedError(msg)
 
         builder.optimize = bp.optimize
+        builder.rep_sample = Bool(bp.rep_sampling)
         builder.opt.orca.parameters = gs_opt_parameters
         builder.exc.orca.parameters = es_parameters
 
@@ -461,8 +464,9 @@ class AtmospecWorkflowStatus(enum.IntEnum):
     OPT = 1
     FC = 2
     WIGNER = 3
-    FINISHED = 4
-    FAILED = 5
+    REPSAMPLE = 4
+    FINISHED = 5
+    FAILED = 6
 
 
 class AtmospecWorkflowProgressWidget(ipw.HBox):
@@ -482,7 +486,7 @@ class AtmospecWorkflowProgressWidget(ipw.HBox):
             description="Workflow progress:",
             value=0,
             min=0,
-            max=4,
+            max=5,
             disabled=False,
             orientations="horizontal",
         )
@@ -507,6 +511,7 @@ class AtmospecWorkflowProgressWidget(ipw.HBox):
                     AtmospecWorkflowStatus.OPT: f"Optimizing conformers {spinner}",
                     AtmospecWorkflowStatus.FC: f"Computing Franck-Condon spectrum {spinner}",
                     AtmospecWorkflowStatus.WIGNER: f"Computing NEA spectrum {spinner}",
+                    AtmospecWorkflowStatus.REPSAMPLE: "Repsample started",
                     AtmospecWorkflowStatus.FINISHED: "Finished successfully! 🎉",
                     AtmospecWorkflowStatus.FAILED: "Failed! 😧",
                 }.get(status, status.name)
@@ -554,6 +559,8 @@ class ViewAtmospecAppWorkChainStatusAndResultsStep(ViewWorkChainStatusStep):
             return AtmospecWorkflowStatus.FC
         elif "optimization" in called_labels:
             return AtmospecWorkflowStatus.OPT
+        elif "repsample" in  called_labels:
+            return AtmospecWorkflowStatus.REPSAMPLE
         else:
             return AtmospecWorkflowStatus.INIT
 
