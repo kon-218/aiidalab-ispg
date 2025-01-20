@@ -17,11 +17,13 @@ from aiida.orm import (
     SinglefileData,
     StructureData,
     TrajectoryData,
+    FolderData,
     to_aiida_type,
     Str
 )
 from aiida.plugins import CalculationFactory, DataFactory, WorkflowFactory
 
+import pathlib
 from aiida_shell import launch_shell_job
 import tempfile
 import subprocess
@@ -94,8 +96,8 @@ class RepSampleWorkChain(WorkChain):
         spec.input('sample_size', valid_type=Int,
                    help='Number of geometries to select')
         spec.input('cycles', valid_type=Int, default=lambda: Int(2000))
-        spec.input('jobs', valid_type=Int, default=lambda: Int(16))
-        spec.input('total_jobs', valid_type=Int, default=lambda: Int(32))
+        spec.input('cores', valid_type=Int, default=lambda: Int(16))
+        spec.input('opt_jobs', valid_type=Int, default=lambda: Int(32))
         spec.input('weight_by_significance', valid_type=Bool, default=lambda: Bool(True))
         spec.input('pdf_comparison', valid_type=Str, default=lambda: Str('KLdiv'))
 
@@ -154,8 +156,8 @@ class RepSampleWorkChain(WorkChain):
         # Log inputs for representative sampling
         self.report(f"Inputs for representative sampling: n_samples={self.inputs.n_samples.value}, "
                     f"n_states={self.inputs.n_states.value}, sample_size={self.inputs.sample_size.value}, "
-                    f"cycles={self.inputs.cycles.value}, jobs={self.inputs.jobs.value}, "
-                    f"total_jobs={self.inputs.total_jobs.value}")
+                    f"cycles={self.inputs.cycles.value}, cores={self.inputs.cores.value}, "
+                    f"opt_jobs={self.inputs.opt_jobs.value}")
 
         try:
             # Debugging: Report the input file contents and other arguments before launching
@@ -168,13 +170,20 @@ class RepSampleWorkChain(WorkChain):
 
             self.report(f"Script path: {script_path}")
             self.report(f"Arguments: -n {self.inputs.n_samples.value} -N {self.inputs.n_states.value} -S {self.inputs.sample_size.value} "
-                        f"-c {self.inputs.cycles.value} -j {self.inputs.jobs.value} -J {self.inputs.total_jobs.value} "
+                        f"-c {self.inputs.cycles.value} -j {self.inputs.cores.value} -J {self.inputs.opt_jobs.value} "
                         f"--pdfcomp KLdiv {self.ctx.input_file}")
+            
+            # Create output directory (temp)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                dirpath = pathlib.Path(tmpdir)
+                folder_data = FolderData(tree=dirpath.absolute())
+            
+            self.report(f"Output folder path {dirpath.absolute()}")
             
             # Launch represample
             results, node = launch_shell_job(
                 "python",
-                arguments=('{script} -n {n_samples} -N {n_states} -S {sample_size} -c {cycles} -j {cores} -J {jobs} -w --verbose --pdfcomp KLdiv {input_file}'),
+                arguments=('{script} -n {n_samples} -N {n_states} -S {sample_size} -c {cycles} -j {cores} -J {opt_jobs} -w --verbose --pdfcomp KLdiv --outdir {temp_outdir} {input_file}'),
                 nodes={
                     'script': SinglefileData(script_path),
                     'input_file': SinglefileData('/home/jovyan/apps/aiidalab-ispg/aiidalab_ispg/workflows/acrolein_input_file.txt'),
@@ -182,8 +191,9 @@ class RepSampleWorkChain(WorkChain):
                     'n_states': Int(self.inputs.n_states.value),
                     'sample_size': Int(self.inputs.sample_size.value),
                     'cycles': Int(self.inputs.cycles.value),
-                    'cores': Int(self.inputs.jobs.value),
-                    'jobs': Int(self.inputs.total_jobs.value),
+                    'cores': Int(self.inputs.cores.value),
+                    'opt_jobs': Int(self.inputs.opt_jobs.value),
+                    'temp_outdir': folder_data,
                 },
                 metadata={
                     'options': {'redirect_stderr':True}
@@ -398,10 +408,10 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             "excitation_data": List(input_data).store(),
             "n_samples": Int(1200),
             "n_states": Int(1),  # Number of excited states
-            "sample_size": Int(2),  # Number of geometries to select
-            "cycles": Int(10),
-            "jobs": Int(1),
-            "total_jobs": Int(1),
+            "sample_size": Int(10),  # Number of geometries to select
+            "cycles": Int(100),
+            "cores": Int(1),
+            "opt_jobs": Int(2),
             "weight_by_significance": Bool(True),
             "pdf_comparison": Str("KLdiv")
         }
