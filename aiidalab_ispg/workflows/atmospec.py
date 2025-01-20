@@ -22,7 +22,7 @@ from aiida.orm import (
 )
 from aiida.plugins import CalculationFactory, DataFactory, WorkflowFactory
 
-# from aiida_shell import launch_shell_job
+from aiida_shell import launch_shell_job
 import tempfile
 import subprocess
 import os
@@ -36,6 +36,7 @@ from .utils import (
     pick_structure_from_trajectory,
     structures_to_trajectory,
 )
+import math
 
 Code = DataFactory("core.code.installed")
 OrcaCalculation = CalculationFactory("orca.orca")
@@ -99,61 +100,144 @@ class RepSampleWorkChain(WorkChain):
 
         # Outputs
         spec.output('selected_indices', valid_type=List)
-
+        
         # Outline
         spec.outline(
             cls.setup_calculation,
             cls.run_representative_sampling,
-            cls.process_results,
         )
+        
+        # Exit codes
+        spec.exit_code(
+            404,
+            "ERROR_MISSING_SCRIPT",
+            "The repre_sample_2D.py script was not found or is not executable.",
+        )
+        spec.exit_code(
+            405,
+            'ERROR_REPRESENTATIVE_SAMPLING_FAILED',
+            "The representative sampling calculation failed."
+        )
+        
+    def _convert_to_tdm(self, excitation_data):
+        """Convert energy and osc values to energy and tdm."""
+        converted_data = []
+        for i, (energy, osc) in enumerate(excitation_data):
+            if i % 2 == 0:  # Energy line
+                converted_energy = energy / 27.211396  # Convert energy
+                tdm_x = math.sqrt(3 * osc / (2 * converted_energy))  # Calculate tdm_x
+                converted_data.append((converted_energy, (tdm_x, 0.0, 0.0)))
+        return converted_data
 
     def setup_calculation(self):
-        """Prepare input file for repre_sample_2D."""
+        """Prepare input file for repre_sample_2D by converting from osc to tdm and writing to file."""
         self.report("Setting up representative sampling calculation")
+        
+        # Convert excitation data
+        converted_data = self._convert_to_tdm(self.inputs.excitation_data)
+
         # Create temporary input file
         with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
-            for energy, osc in self.inputs.excitation_data:
-                f.write(f"{energy:.6f}\n")
-                f.write(f"{osc:.6f}\n")
+            for energy, tdm in converted_data:
+                f.write(f"{energy:.6f}\n")  # Write energy
+                f.write(f"{tdm[0]:.6f} {tdm[1]:.6f} {tdm[2]:.6f}\n")  # Write tdm
             self.ctx.input_file = f.name
 
     def run_representative_sampling(self):
         """
         Runs the representative sampling calculation using repre_sample_2D.py
-        from the app directory. This method constructs and executes the sampling
-        command with appropriate parameters.
+        from the app directory via aiida-shell.
         """
-        try:
-            # **Use the absolute path to the script here:**
-            script_path = "/apps/aiidalab-ispg/aiidalab_ispg/app/repre_sample_2D.py"  # **Replace with the actual path**
-        except FileNotFoundError as e:
-            self.report(f"Error finding repre_sample_2D.py script: {str(e)}")
+        self.report("Running representative sampling with aiida-shell.")
+
+        script_path = "/home/jovyan/apps/aiidalab-ispg/aiidalab_ispg/workflows/repre_sample_2D.py"
+        if not os.path.isfile(script_path):
+            self.report(f"Error: repre_sample_2D.py script not found at {script_path}")
             return self.exit_codes.ERROR_MISSING_SCRIPT
 
-        command = [
-            "repre_sample_2D.py",
-            "-n", str(self.inputs.n_samples.value),
-            "-N", str(self.inputs.n_states.value),
-            "-S", str(self.inputs.sample_size.value),
-            "-c", str(self.inputs.cycles.value),
-            "-j", str(self.inputs.jobs.value),
-            "-J", str(self.inputs.total_jobs.value)
-        ]
+        input_file_node = SinglefileData(file=self.ctx.input_file)
 
-        if self.inputs.weight_by_significance.value:
-            command.append("-w")
-        command.extend([
-            "--pdfcomp", self.inputs.pdf_comparison.value,
-            self.ctx.input_file
-        ])
+        # Log input file path
+        self.report(f"Input file path: {self.ctx.input_file}")
 
-        # Run the command and capture output
-        result = subprocess.run(command, capture_output=True, text=True)
-        self.ctx.output = result.stdout
+        # Log inputs for representative sampling
+        self.report(f"Inputs for representative sampling: n_samples={self.inputs.n_samples.value}, "
+                    f"n_states={self.inputs.n_states.value}, sample_size={self.inputs.sample_size.value}, "
+                    f"cycles={self.inputs.cycles.value}, jobs={self.inputs.jobs.value}, "
+                    f"total_jobs={self.inputs.total_jobs.value}")
 
-        # Clean up input file
-        os.unlink(self.ctx.input_file)
+        try:
+            results, node = launch_shell_job(
+                "echo",
+                arguments=('{script} -n {n_samples} -N {n_states} -S {sample_size} --mine 1.7 --maxe 5.4 -c {cycles} -j {cores} -J {jobs} -w -v --pdfcomp KLdiv {input_file}'),
+                nodes={
+                    'script': SinglefileData(script_path),
+                    'input_file': SinglefileData(file=self.ctx.input_file),
+                    'n_samples': Int(self.inputs.n_samples.value),
+                    'n_states': Int(self.inputs.n_states.value),
+                    'sample_size': Int(self.inputs.sample_size.value),
+                    'cycles': Int(self.inputs.cycles.value),
+                    'cores': Int(self.inputs.jobs.value),
+                    'jobs': Int(self.inputs.total_jobs.value),
+                },
+            )
+            
+            # Log available result keys
+            self.report(f"Available results keys: {list(results.keys())}")
+            
+            self.report(f"STDOUT: {results['stdout'].get_content()}")
 
+            self.report("Representative sampling completed successfully.")
+        except Exception as e:
+            self.report(f"Representative sampling failed with error: {str(e)}")
+            return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
+
+        
+        try:
+            results, node = launch_shell_job(
+                "python",
+                arguments=('{script}'),
+                nodes={
+                    'script': SinglefileData(script_path),
+                    'input_file': SinglefileData(file=self.ctx.input_file),
+                    'n_samples': Int(self.inputs.n_samples.value),
+                    'n_states': Int(self.inputs.n_states.value),
+                    'sample_size': Int(self.inputs.sample_size.value),
+                    'cycles': Int(self.inputs.cycles.value),
+                    'cores': Int(self.inputs.jobs.value),
+                    'jobs': Int(self.inputs.total_jobs.value),
+                },
+                metadata={
+                    'options': {'redirect_stderr':True}
+                },
+            )
+            
+            # Log available result keys
+            self.report(f"Available results keys: {list(results.keys())}")
+            
+            self.report(f"STDOUT: {results['stdout'].get_content()}")
+
+            # Fallback handling for missing 'output.txt'
+            if 'output.txt' not in results:
+                self.report("Error: 'output.txt' not found in results.")
+                return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
+
+            # Parse output
+            self.ctx.output = results['output.txt'].get_content()
+            self.report("Representative sampling completed successfully.")
+        except Exception as e:
+            self.report(f"Representative sampling failed with error: {str(e)}")
+            return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
+        
+        
+        # Clean up temporary file
+        try:
+            os.unlink(self.ctx.input_file)
+            self.report("Cleaned up temporary input file.")
+        except Exception as e:
+            self.report(f"Warning: Failed to delete temporary input file: {str(e)}")
+
+    
     def process_results(self):
         """Process output to get selected geometry indices."""
         # Parse output to get selected indices
@@ -330,12 +414,12 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
         # Create inputs for RepSampleWorkChain
         inputs = {
             "excitation_data": List(input_data).store(),
-            "n_samples": self.inputs.nwigner,
-            "n_states": Int(len(excitation_data)),  # Number of excited states
-            "sample_size": Int(20),  # Number of geometries to select
-            "cycles": Int(2000),
-            "jobs": Int(16),
-            "total_jobs": Int(32),
+            "n_samples": Int(3),
+            "n_states": Int(1),  # Number of excited states
+            "sample_size": Int(2),  # Number of geometries to select
+            "cycles": Int(10),
+            "jobs": Int(1),
+            "total_jobs": Int(1),
             "weight_by_significance": Bool(True),
             "pdf_comparison": Str("KLdiv")
         }

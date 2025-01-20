@@ -48,8 +48,7 @@ def read_cmd():
                         help='Method for comparison of probability density functions.')
     parser.add_argument('--intweights', action='store_true',
                         help='Activate optimization of integer weights for individual geometries (instead of 0/1).')
-    parser.add_argument('--outdir', help='Output directory.')
-
+    
     return parser.parse_args()
 
 class PDFDiv:
@@ -168,7 +167,7 @@ class PDFDiv:
 class GeomReduction:
     """Main class for the optimization of representative sample."""
 
-    def __init__(self, nsamples, nstates, subset, cycles, ncores, njobs, weighted, pdfcomp, intweights, verbose, outdir, dim1=False):
+    def __init__(self, nsamples, nstates, subset, cycles, ncores, njobs, weighted, pdfcomp, intweights, verbose, dim1=False):
         self.nsamples = nsamples
         # if nstates > 1:
         #     print("ERROR: implemented only for 1 state!")
@@ -190,8 +189,6 @@ class GeomReduction:
         self.intweights = intweights
         self.dim1 = dim1
         self.pid = os.getpid()
-        self.outdir = outdir
-        #print(self.outdir)
             
     def read_data(self, infile):
         """Reads and parses input data from given input file."""
@@ -244,7 +241,7 @@ class GeomReduction:
 
         bname = os.path.basename(self.infile)
         name = bname.split(".")[0]
-        return 'absspec.' + name + '.n' + str(self.nsamples) + '.' + self.time.strftime('%Y-%m-%d_%H-%M-%S') # + '.' + str(self.cycles) + "." + str(self.njobs)
+        return 'absspec.' + name + '.n' + str(self.nsamples) + '.' + self.time.strftime('%Y-%m-%d_%H-%M-%S') # + '.' + str(self.pid)
 
         
     def get_PDF(self, samples=None, sweights=None, h='silverman', gen_grid=False):
@@ -388,7 +385,7 @@ class GeomReduction:
         if test:
             subsamples = self.subsamples
             weights = self.sweights
-            it = 1  
+            it = 1
             diffmax = 0
             diffmin = np.inf
         else:
@@ -525,7 +522,7 @@ class GeomReduction:
     def reduce_geoms_worker(self, i, li=None, lf=None):
         """Wrapper for SA opt. for the selection of a subsample minimizing given divergence."""
 
-        name =  self.get_name() + '.r' + str(self.subset)
+        name = self.get_name() + '.r' + str(self.subset)
         os.chdir(name)
         orig_stdout = sys.stdout
         with open('output_r'+str(self.subset)+'.txt', 'a') as f:
@@ -582,8 +579,8 @@ class GeomReduction:
         intensity = self.get_PDF(self.subsamples, self.sweights)
         print('optimal PDF sum', np.sum(intensity))
         name = self.get_name()+'.r'+str(self.subset)+'.'+suffix+str(min_index)
-        np.savetxt( name+'.exc.txt', self.exc[self.subsamples])
-        np.savetxt( name+'.tdm.txt', self.trans[self.subsamples])
+        np.savetxt(name+'.exc.txt', self.exc[self.subsamples])
+        np.savetxt(name+'.tdm.txt', self.trans[self.subsamples])
         np.savetxt(name+'.pdf.txt', np.vstack((self.grid, intensity)).T)
         self.save_pdf(pdf=intensity, fname=name+'.pdf', markers=True)
 
@@ -668,17 +665,11 @@ class GeomReduction:
 
     def writegeoms(self, index=None):
         """Writes a file with indices of the selected representative geometries."""
-        print(os.getcwd())
+
         indexstr = ''
         if index is not None:
             indexstr = '.' + str(index)
-        outfile = self.outdir+self.get_name() + str(self.cycles) + "." + str(self.njobs) + '.geoms.txt'
-        
-        directory = os.path.dirname(outfile)
-    
-        # Create the directory if it doesn't exist
-        os.makedirs(directory, exist_ok=True)
-        
+        outfile = self.get_name() + indexstr + '.geoms.txt'
         with open(outfile, "w") as f:
             for i in range(len(self.subsamples)):
                 if self.sweights is None:
@@ -690,16 +681,15 @@ if __name__ == "__main__":
     random.seed(0)
     start_time = time.time()
     options = read_cmd()
-    options.verbose=True
-    #if options.verbose:
-    print("OPTIONS:")
-    for option in vars(options):
-        print(option, getattr(options, option))
-    print()
-    print("Number of CPUs on this machine:", cpu_count())
+    if options.verbose:
+        print("OPTIONS:")
+        for option in vars(options):
+            print(option, getattr(options, option))
+        print()
+        print("Number of CPUs on this machine:", cpu_count())
 
     geomReduction = GeomReduction(options.nsamples, options.nstates, options.subset, options.cycles, options.ncores,
-                                  options.njobs, options.weighted, options.pdfcomp, options.intweights, options.verbose, options.outdir)
+                                  options.njobs, options.weighted, options.pdfcomp, options.intweights, options.verbose)
     geomReduction.read_data(options.infile)
     geomReduction.reduce_geoms()
     
