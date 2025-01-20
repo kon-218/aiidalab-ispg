@@ -66,6 +66,7 @@ class OrcaExcitationWorkChain(OrcaBaseWorkChain):
             # Perhaps we should do the conversion here,
             # to make this less ORCA specific.
             "excitation_energies_cm": orca_output_params["etenergies"],
+            "moments": orca_output_params["moments"]
         }
 
     @process_handler(exit_codes=ExitCode(0), priority=600)
@@ -85,7 +86,7 @@ class RepSampleWorkChain(WorkChain):
         super().define(spec)
         # Inputs
         spec.input('excitation_data', valid_type=List,
-                   help='List of tuples containing (energy, oscillator_strength)')
+                   help='List of tuples containing (energy, transition dipole moments)')
         spec.input('n_samples', valid_type=Int,
                    help='Total number of geometries')
         spec.input('n_states', valid_type=Int,
@@ -119,28 +120,18 @@ class RepSampleWorkChain(WorkChain):
             "The representative sampling calculation failed."
         )
         
-    def _convert_to_tdm(self, excitation_data):
-        """Convert energy and osc values to energy and tdm."""
-        converted_data = []
-        for i, (energy, osc) in enumerate(excitation_data):
-            if i % 2 == 0:  # Energy line
-                converted_energy = energy / 27.211396  # Convert energy
-                tdm_x = math.sqrt(3 * osc / (2 * converted_energy))  # Calculate tdm_x
-                converted_data.append((converted_energy, (tdm_x, 0.0, 0.0)))
-        return converted_data
-
     def setup_calculation(self):
-        """Prepare input file for repre_sample_2D by converting from osc to tdm and writing to file."""
+        """Prepare input file for repre_sample_2D by writing excitation data to file."""
         self.report("Setting up representative sampling calculation")
         
-        # Convert excitation data
-        converted_data = self._convert_to_tdm(self.inputs.excitation_data)
+#         if len(self.inputs.excitation_data) < self.inputs.n_samples.value * self.inputs.n_states.value:
+#             self.report("Error: Not enough transitions in excitation_data for the requested sampling.")
+#             return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
 
-        # Create temporary input file
         with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
-            for energy, tdm in converted_data:
-                f.write(f"{energy:.6f}\n")  # Write energy
-                f.write(f"{tdm[0]:.6f} {tdm[1]:.6f} {tdm[2]:.6f}\n")  # Write tdm
+            for energy, tdm in self.inputs.excitation_data:
+                f.write(f"{energy:.6f}\n")
+                f.write(f"{tdm[0]:.6f} {tdm[1]:.6f} {tdm[2]:.6f}\n")
             self.ctx.input_file = f.name
 
     def run_representative_sampling(self):
@@ -167,39 +158,26 @@ class RepSampleWorkChain(WorkChain):
                     f"total_jobs={self.inputs.total_jobs.value}")
 
         try:
-            results, node = launch_shell_job(
-                "echo",
-                arguments=('{script} -n {n_samples} -N {n_states} -S {sample_size} --mine 1.7 --maxe 5.4 -c {cycles} -j {cores} -J {jobs} -w -v --pdfcomp KLdiv {input_file}'),
-                nodes={
-                    'script': SinglefileData(script_path),
-                    'input_file': SinglefileData(file=self.ctx.input_file),
-                    'n_samples': Int(self.inputs.n_samples.value),
-                    'n_states': Int(self.inputs.n_states.value),
-                    'sample_size': Int(self.inputs.sample_size.value),
-                    'cycles': Int(self.inputs.cycles.value),
-                    'cores': Int(self.inputs.jobs.value),
-                    'jobs': Int(self.inputs.total_jobs.value),
-                },
-            )
-            
-            # Log available result keys
-            self.report(f"Available results keys: {list(results.keys())}")
-            
-            self.report(f"STDOUT: {results['stdout'].get_content()}")
+            # Debugging: Report the input file contents and other arguments before launching
+            self.report(f"Input file path: {self.ctx.input_file}")
 
-            self.report("Representative sampling completed successfully.")
-        except Exception as e:
-            self.report(f"Representative sampling failed with error: {str(e)}")
-            return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
+            # Read the input file and report its contents (if it's a text file or similar)
+            with open(self.ctx.input_file, 'r') as f:
+                input_file_content = f.read()
+            self.report(f"Input file content:\n{input_file_content}")
 
-        
-        try:
+            self.report(f"Script path: {script_path}")
+            self.report(f"Arguments: -n {self.inputs.n_samples.value} -N {self.inputs.n_states.value} -S {self.inputs.sample_size.value} "
+                        f"-c {self.inputs.cycles.value} -j {self.inputs.jobs.value} -J {self.inputs.total_jobs.value} "
+                        f"--pdfcomp KLdiv {self.ctx.input_file}")
+            
+            # Launch represample
             results, node = launch_shell_job(
                 "python",
-                arguments=('{script}'),
+                arguments=('{script} -n {n_samples} -N {n_states} -S {sample_size} -c {cycles} -j {cores} -J {jobs} -w --verbose --pdfcomp KLdiv {input_file}'),
                 nodes={
                     'script': SinglefileData(script_path),
-                    'input_file': SinglefileData(file=self.ctx.input_file),
+                    'input_file': SinglefileData('/home/jovyan/apps/aiidalab-ispg/aiidalab_ispg/workflows/acrolein_input_file.txt'),
                     'n_samples': Int(self.inputs.n_samples.value),
                     'n_states': Int(self.inputs.n_states.value),
                     'sample_size': Int(self.inputs.sample_size.value),
@@ -251,6 +229,7 @@ class RepSampleWorkChain(WorkChain):
             return self.exit_codes.ERROR_NO_SELECTED_INDICES
 
         self.out('selected_indices', List(selected_indices).store())
+
 
 
 class OrcaWignerSpectrumWorkChain(WorkChain):
@@ -389,17 +368,20 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             if not calc.is_finished_ok:
                 self.report(f"Skipping failed Wigner calculation {calc.pk}")
                 continue
-
+                
+                
             # Extract the excitation energies and oscillator strengths
             data = calc.outputs.excitations.get_dict()
+            self.report(list(data.keys()))
             energies = data["excitation_energies_cm"]
 
             # Convert from cm^-1 to eV (1 cm^-1 = 1.23984193 × 10^-4 eV)
             energies_ev = [e * 1.23984193e-4 for e in energies]
             oscs = data["oscillator_strengths"]
-
+            moments = data["moments"][1:]
+            
             # Add this geometry's data
-            excitation_data.append((energies_ev, oscs))
+            excitation_data.append((energies_ev, moments))
 
         if not excitation_data:
             self.report("No valid excitation data available for representative sampling")
@@ -407,14 +389,14 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
 
         # Format data for representative sampling
         input_data = []
-        for energies, oscs in excitation_data:
-            for energy, osc in zip(energies, oscs):
-                input_data.append((energy, osc))
+        for energies, moments in excitation_data:
+            for energy, moment in zip(energies, moments):
+                input_data.append((energy, moment))
 
         # Create inputs for RepSampleWorkChain
         inputs = {
             "excitation_data": List(input_data).store(),
-            "n_samples": Int(3),
+            "n_samples": Int(1200),
             "n_states": Int(1),  # Number of excited states
             "sample_size": Int(2),  # Number of geometries to select
             "cycles": Int(10),
