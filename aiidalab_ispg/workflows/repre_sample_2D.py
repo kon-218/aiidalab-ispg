@@ -48,8 +48,7 @@ def read_cmd():
                         help='Method for comparison of probability density functions.')
     parser.add_argument('--intweights', action='store_true',
                         help='Activate optimization of integer weights for individual geometries (instead of 0/1).')
-    parser.add_argument('--outdir', help='Output directory.')
-
+    
     return parser.parse_args()
 
 class PDFDiv:
@@ -168,7 +167,7 @@ class PDFDiv:
 class GeomReduction:
     """Main class for the optimization of representative sample."""
 
-    def __init__(self, nsamples, nstates, subset, cycles, ncores, njobs, weighted, pdfcomp, intweights, verbose, outdir, dim1=False):
+    def __init__(self, nsamples, nstates, subset, cycles, ncores, njobs, weighted, pdfcomp, intweights, verbose, dim1=False):
         self.nsamples = nsamples
         # if nstates > 1:
         #     print("ERROR: implemented only for 1 state!")
@@ -190,7 +189,6 @@ class GeomReduction:
         self.intweights = intweights
         self.dim1 = dim1
         self.pid = os.getpid()
-        self.outdir = outdir
             
     def read_data(self, infile):
         """Reads and parses input data from given input file."""
@@ -524,7 +522,7 @@ class GeomReduction:
     def reduce_geoms_worker(self, i, li=None, lf=None):
         """Wrapper for SA opt. for the selection of a subsample minimizing given divergence."""
 
-        name =  self.get_name() + '.r' + str(self.subset)
+        name = self.get_name() + '.r' + str(self.subset)
         os.chdir(name)
         orig_stdout = sys.stdout
         with open('output_r'+str(self.subset)+'.txt', 'a') as f:
@@ -581,8 +579,8 @@ class GeomReduction:
         intensity = self.get_PDF(self.subsamples, self.sweights)
         print('optimal PDF sum', np.sum(intensity))
         name = self.get_name()+'.r'+str(self.subset)+'.'+suffix+str(min_index)
-        np.savetxt( name+'.exc.txt', self.exc[self.subsamples])
-        np.savetxt( name+'.tdm.txt', self.trans[self.subsamples])
+        np.savetxt(name+'.exc.txt', self.exc[self.subsamples])
+        np.savetxt(name+'.tdm.txt', self.trans[self.subsamples])
         np.savetxt(name+'.pdf.txt', np.vstack((self.grid, intensity)).T)
         self.save_pdf(pdf=intensity, fname=name+'.pdf', markers=True)
 
@@ -672,9 +670,6 @@ class GeomReduction:
         if index is not None:
             indexstr = '.' + str(index)
         outfile = self.get_name() + indexstr + '.geoms.txt'
-        print(os.getcwd())
-        directory = os.path.dirname(outfile)
-        
         with open(outfile, "w") as f:
             for i in range(len(self.subsamples)):
                 if self.sweights is None:
@@ -694,7 +689,7 @@ if __name__ == "__main__":
         print("Number of CPUs on this machine:", cpu_count())
 
     geomReduction = GeomReduction(options.nsamples, options.nstates, options.subset, options.cycles, options.ncores,
-                                  options.njobs, options.weighted, options.pdfcomp, options.intweights, options.verbose,options.outdir)
+                                  options.njobs, options.weighted, options.pdfcomp, options.intweights, options.verbose)
     geomReduction.read_data(options.infile)
     geomReduction.reduce_geoms()
     

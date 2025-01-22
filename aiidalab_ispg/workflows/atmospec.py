@@ -108,6 +108,7 @@ class RepSampleWorkChain(WorkChain):
         spec.outline(
             cls.setup_calculation,
             cls.run_representative_sampling,
+            cls.extract_geoms,
         )
         
         # Exit codes
@@ -173,17 +174,16 @@ class RepSampleWorkChain(WorkChain):
                         f"-c {self.inputs.cycles.value} -j {self.inputs.cores.value} -J {self.inputs.opt_jobs.value} "
                         f"--pdfcomp KLdiv {self.ctx.input_file}")
             
-            # Create output directory (temp)
-            with tempfile.TemporaryDirectory() as tmpdir:
-                dirpath = pathlib.Path(tmpdir)
-                folder_data = FolderData(tree=dirpath.absolute())
+            
+            dirpath = pathlib.Path("./")
+            folder_data = FolderData(tree=dirpath.absolute())
             
             self.report(f"Output folder path {dirpath.absolute()}")
             
             # Launch represample
             results, node = launch_shell_job(
                 "python",
-                arguments=('{script} -n {n_samples} -N {n_states} -S {sample_size} -c {cycles} -j {cores} -J {opt_jobs} -w --verbose --pdfcomp KLdiv --outdir {temp_outdir} {input_file}'),
+                arguments=('{script} -n {n_samples} -N {n_states} -S {sample_size} -c {cycles} -j {cores} -J {opt_jobs} -w --verbose --pdfcomp KLdiv {input_file}'),
                 nodes={
                     'script': SinglefileData(script_path),
                     'input_file': SinglefileData('/home/jovyan/apps/aiidalab-ispg/aiidalab_ispg/workflows/acrolein_input_file.txt'),
@@ -193,11 +193,11 @@ class RepSampleWorkChain(WorkChain):
                     'cycles': Int(self.inputs.cycles.value),
                     'cores': Int(self.inputs.cores.value),
                     'opt_jobs': Int(self.inputs.opt_jobs.value),
-                    'temp_outdir': folder_data,
                 },
                 metadata={
                     'options': {'redirect_stderr':True}
                 },
+                outputs=['absspec*']
             )
             
             # Log available result keys
@@ -205,26 +205,69 @@ class RepSampleWorkChain(WorkChain):
             
             self.report(f"STDOUT: {results['stdout'].get_content()}")
 
-            # Fallback handling for missing 'output.txt'
-            if 'output.txt' not in results:
-                self.report("Error: 'output.txt' not found in results.")
+            # Store results in context
+            self.ctx.repsample_results = results
+            self.ctx.repsample_node = node
+
+            # Log available result keys
+            self.report(f"Available results keys: {list(results.keys())}")
+
+            # Find geometry file in results
+            geom_files = [key for key in results.keys() if key.endswith('_geoms_txt')]
+            if not geom_files:
+                self.report("Error: No geometry file found in results.")
                 return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
 
-            # Parse output
-            self.ctx.output = results['output.txt'].get_content()
+            # Store geometry content in context
+            self.ctx.rep_geoms_file = results[geom_files[0]].get_content()
+
             self.report("Representative sampling completed successfully.")
+        
         except Exception as e:
             self.report(f"Representative sampling failed with error: {str(e)}")
             return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
-        
-        
-        # Clean up temporary file
-        try:
-            os.unlink(self.ctx.input_file)
-            self.report("Cleaned up temporary input file.")
-        except Exception as e:
-            self.report(f"Warning: Failed to delete temporary input file: {str(e)}")
+            
+    def extract_geoms(self):
+        """
+        Extract geometry indices from the calculation results and store them in the workflow context.
+        Must be called after run_representative_sampling has completed successfully.
+        """
+        self.report("Extracting geometry indices from results")
 
+        indices = []
+
+        try:
+            # Get geometry content directly from context
+            if not hasattr(self.ctx, 'rep_geoms_file'):
+                self.report("No geometry file content found in context")
+                return self.exit_codes.ERROR_MISSING_OUTPUT_FILES
+
+            content = self.ctx.rep_geoms_file
+
+            # Parse each line as an integer index
+            for line in content.strip().split('\n'):
+                if line.strip():  # Skip empty lines
+                    try:
+                        index = int(line.strip())
+                        indices.append(index)
+                    except ValueError as e:
+                        self.report(f"Error parsing index from line '{line}': {str(e)}")
+                        continue
+
+            # Store sorted indices in context
+            self.ctx.selected_indices = sorted(indices)
+
+            # Report number of indices found
+            self.report(f"Found {len(self.ctx.selected_indices)} geometry indices")
+
+            # Store as output node
+            self.out('selected_indices', List(list=self.ctx.selected_indices))
+
+        except Exception as e:
+            self.report(f"Error in extract_geoms: {str(e)}")
+            return self.exit_codes.ERROR_EXTRACTION_FAILED
+
+        return
     
     def process_results(self):
         """Process output to get selected geometry indices."""
