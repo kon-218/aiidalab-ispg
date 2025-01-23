@@ -61,11 +61,19 @@ class SpectrumAnalysisWidget(ipw.VBox):
             (self, "cross_section_nm"),
             (self.photolysis_tab, "cross_section_nm"),
         )
+        
+        self.repsample_tab = RepsampleAnalysisWidget()
+        ipw.dlink(
+            (self, "disabled"),
+            (self.photolysis_tab, "disabled"),
+        )
+        
 
-        tab_components = [self.photolysis_tab, self.density_tab]
+        tab_components = [self.photolysis_tab, self.density_tab, self.repsample_tab]
         tab = ipw.Tab(children=tab_components)
         tab.set_title(0, "Photolysis constant")
         tab.set_title(1, "Individual transitions")
+        tab.set_title(2, "Repsample output")
         super().__init__(children=[title, tab])
 
     def reset(self):
@@ -461,3 +469,12 @@ class PhotolysisPlotWidget(ipw.VBox):
         :param update: Whether to update the figure after removing the line. Default is True.
         """
         self.figure.remove_renderer(label, update=update)
+    
+class RepsampleAnalysisWidget(ipw.VBox):
+    disabled = tl.Bool(default=True)
+    def __init__(self):
+        
+        super().__init__(
+            children=[
+            ]
+        )
