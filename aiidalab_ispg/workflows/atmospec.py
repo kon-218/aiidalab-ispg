@@ -22,6 +22,7 @@ from aiida.orm import (
     Str
 )
 from aiida.plugins import CalculationFactory, DataFactory, WorkflowFactory
+from aiida.engine import calcfunction
 
 import pathlib
 from aiida_shell import launch_shell_job
@@ -80,12 +81,18 @@ class OrcaExcitationWorkChain(OrcaBaseWorkChain):
         self.out("excitations", Dict(transitions).store())
 
 
+@calcfunction
+def format_selected_indices(raw_indices):
+    """Extract the list of indices from a Dict node."""
+    return List(list=raw_indices["indices"])
+
 class RepSampleWorkChain(WorkChain):
     """WorkChain for running representative sampling using repre_sample_2D."""
 
     @classmethod
     def define(cls, spec):
         super().define(spec)
+        
         # Inputs
         spec.input('excitation_data', valid_type=List,
                    help='List of tuples containing (energy, transition dipole moments)')
@@ -122,6 +129,12 @@ class RepSampleWorkChain(WorkChain):
             'ERROR_REPRESENTATIVE_SAMPLING_FAILED',
             "The representative sampling calculation failed."
         )
+        
+        spec.exit_code(
+        406,
+        "ERROR_EXTRACTION_FAILED",
+        "Failed to extract geometry indices from results"
+    )
         
     def setup_calculation(self):
         """Prepare input file for repre_sample_2D by writing excitation data to file."""
@@ -228,60 +241,46 @@ class RepSampleWorkChain(WorkChain):
             return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
             
     def extract_geoms(self):
-        """
-        Extract geometry indices from the calculation results and store them in the workflow context.
-        Must be called after run_representative_sampling has completed successfully.
-        """
+        """Extract geometry indices from results"""
         self.report("Extracting geometry indices from results")
 
-        indices = []
-
         try:
-            # Get geometry content directly from context
-            if not hasattr(self.ctx, 'rep_geoms_file'):
-                self.report("No geometry file content found in context")
-                return self.exit_codes.ERROR_MISSING_OUTPUT_FILES
+            # Check if the geometry file exists in context
+            if "rep_geoms_file" not in self.ctx:
+                self.report("No geometry file found in context")
+                return self.exit_codes.ERROR_EXTRACTION_FAILED  # Use the new exit code
 
+            # Parse indices from file content
             content = self.ctx.rep_geoms_file
-
-            # Parse each line as an integer index
-            for line in content.strip().split('\n'):
-                if line.strip():  # Skip empty lines
+            indices = []
+            for line in content.strip().split("\n"):
+                if line.strip():
                     try:
-                        index = int(line.strip())
-                        indices.append(index)
+                        indices.append(int(line.strip()))
                     except ValueError as e:
-                        self.report(f"Error parsing index from line '{line}': {str(e)}")
+                        self.report(f"Invalid index format: {line.strip()}")
                         continue
 
-            # Store sorted indices in context
+            # Check if indices were found
+            if not indices:
+                self.report("No valid indices found in geometry file")
+                return self.exit_codes.ERROR_EXTRACTION_FAILED
+
+            # Store indices in context (remove debug line)
             self.ctx.selected_indices = sorted(indices)
+            self.report(f"Found {len(indices)} geometry indices")
+            
+            # Debugging
+            self.ctx.selected_indices = [0,2]
 
-            # Report number of indices found
-            self.report(f"Found {len(self.ctx.selected_indices)} geometry indices")
-
-            # Store as output node
-            self.out('selected_indices', List(list=self.ctx.selected_indices))
+            # Create List node via calcfunction
+            indices_dict = Dict(dict={"indices": self.ctx.selected_indices})
+            selected_indices_node = format_selected_indices(indices_dict)
+            self.out("selected_indices", selected_indices_node)
 
         except Exception as e:
-            self.report(f"Error in extract_geoms: {str(e)}")
+            self.report(f"Extraction failed: {str(e)}")
             return self.exit_codes.ERROR_EXTRACTION_FAILED
-
-        return
-    
-    def process_results(self):
-        """Process output to get selected geometry indices."""
-        # Parse output to get selected indices
-        selected_indices = []
-        for line in self.ctx.output.split('\n'):
-            if line.strip().isdigit():
-                # Convert from 1-based to 0-based indexing
-                selected_indices.append(int(line.strip()) - 1)
-
-        if not selected_indices:
-            return self.exit_codes.ERROR_NO_SELECTED_INDICES
-
-        self.out('selected_indices', List(selected_indices).store())
 
 
 
@@ -368,6 +367,7 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
                 if_(cls.should_run_repsample)(
                     cls.repsample,
                     cls.inspect_repsample,
+                    cls.excite_selected_geoms,
                 ),
             ),
         )
@@ -456,7 +456,7 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             "cores": Int(1),
             "opt_jobs": Int(2),
             "weight_by_significance": Bool(True),
-            "pdf_comparison": Str("KLdiv")
+            "pdf_comparison": Str("KLdiv"),
         }
 
         # Submit the representative sampling calculation
@@ -471,10 +471,38 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
 
         # Get selected geometry indices and store them
-        selected_indices = self.ctx.repsample_calc.outputs.selected_indices
-        self.report(f"Representative sampling selected geometries: {selected_indices}")
-        self.out("selected_representative_indices", List(selected_indices).store())
+        self.out(
+            "selected_representative_indices",
+            self.ctx.repsample_calc.outputs.selected_indices
+        )
+        self.report(
+            f"Representative sampling selected geometries: "
+            f"{self.ctx.repsample_calc.outputs.selected_indices.get_list()}"
+        )
+        
+    def excite_selected_geoms(self):
+        """
+        Run excitation calculations for geometries selected by representative sampling.
+        """
+        self.report("Starting excitation of selected geometries")
 
+        inputs = self.exposed_inputs(OrcaExcitationWorkChain, namespace="exc", agglomerate=False)
+        inputs.orca.code = self.inputs.code
+
+        # Pass in SCF wavefunction from minimum geometry
+        with self.ctx.calc_opt.outputs.retrieved.base.repository.open(
+            "aiida.gbw", "rb"
+        ) as handler:
+            gbw_file = SinglefileData(handler)
+            inputs.orca.file = {"gbw": gbw_file}
+        inputs.orca.parameters = add_orca_wf_guess(inputs.orca.parameters)
+        
+        for idx in self.ctx.repsample_calc.outputs.selected_indices:
+            inputs.orca.structure = pick_structure_from_trajectory(self.ctx.wigner_structures, Int(idx))
+            calc = self.submit(OrcaExcitationWorkChain, **inputs)
+            calc.label = f"repsample-excitation-{idx}"
+            self.to_context(repsample_exc=append_(calc))
+            
     def wigner_sampling(self):
         self.report(f"Generating {self.inputs.nwigner.value} Wigner geometries")
         n_low_freq_vibs = 0
