@@ -175,6 +175,9 @@ class SpectrumWidget(ipw.VBox):
         [traitlets.Instance(StructureData), traitlets.Instance(TrajectoryData)],
         allow_none=True,
     )
+    repsample_results = traitlets.Dict(
+        allow_none=True, default=None
+    )
 
     selected_conformer_id = traitlets.Int(allow_none=True, default_value=None)
 
@@ -307,6 +310,11 @@ class SpectrumWidget(ipw.VBox):
             (self, "cross_section_nm"),
             (self.analysis, "cross_section_nm"),
         )
+        ipw.dlink(
+            (self, "repsample_results"),
+            (self.analysis, "repsample_results"),
+        )
+        print("spectrum:", self.repsample_results)
 
         super().__init__(
             [

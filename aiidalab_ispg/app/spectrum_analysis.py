@@ -38,6 +38,8 @@ class SpectrumAnalysisWidget(ipw.VBox):
     cross_section_nm = tl.Dict(allow_none=True, default=None)
 
     disabled = tl.Bool(default=True)
+    
+    repsample_results = tl.Dict(default=None, allow_none=True)
 
     def __init__(self):
         title = ipw.HTML("<h3>Spectrum analysis</h3>")
@@ -66,6 +68,10 @@ class SpectrumAnalysisWidget(ipw.VBox):
         ipw.dlink(
             (self, "disabled"),
             (self.photolysis_tab, "disabled"),
+        )
+        ipw.dlink(
+            (self, "repsample_results"),
+            (self.repsample_tab, "data"),
         )
         
 
@@ -472,9 +478,134 @@ class PhotolysisPlotWidget(ipw.VBox):
     
 class RepsampleAnalysisWidget(ipw.VBox):
     disabled = tl.Bool(default=True)
+    data = tl.Dict(default=None, allow_none=True) 
+    
     def __init__(self):
+        # Placeholder images using transparent PNG
+        transparent_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
         
-        super().__init__(
-            children=[
-            ]
+        # Image widgets with placeholder
+        self.reduced_image = ipw.Image(
+            value=transparent_png.encode(),
+            format='png',
+            width=300,
+            height=300,
+            layout={"margin": "10px"}
         )
+        self.original_image = ipw.Image(
+            value=transparent_png.encode(),
+            format='png',
+            width=300,
+            height=300,
+            layout={"margin": "10px"}
+        )
+        
+        self.summary_html = ipw.HTML()
+
+        # Left pane with left-aligned text and images
+        left_pane = ipw.VBox(
+            children=[
+                ipw.HTML("<h4 style='margin: 10px 0;'>Reduced Density Plot:</h4>"),
+                self.reduced_image,
+                ipw.HTML("<h4 style='margin: 10px 0;'>Original Density Plot:</h4>"),
+                self.original_image,
+            ],
+            layout=ipw.Layout(
+                width="50%",
+                align_items="flex-start",  # Left alignment
+                padding="0 20px"
+            )
+        )
+
+        # Update right pane
+        right_pane = ipw.VBox(
+            children=[
+                ipw.HTML("<h4><u>Summary</u></h4>"),
+                self.summary_html,
+#                 self.dl_reduced_sample,
+#                 self.dl_report,
+            ],
+            layout=ipw.Layout(width="45%", padding="10px")
+        )
+        
+        # Main container
+        main_container = ipw.HBox(
+            children=[left_pane, right_pane],
+            layout=ipw.Layout(
+                width="100%",
+                justify_content="space-between",
+                padding="10px"
+            )
+        )
+        
+        super().__init__(children=[main_container])
+    
+    def _update_summary(self):
+        """Update summary table using Python string formatting"""
+        data = self.data or {}
+        c0_data = data.get('c0', {})
+        stats = c0_data.get("statistics", {})
+        opts = c0_data.get("options", {})
+
+        # Formatting helper
+        def fmt(val, default="N/A", precision=4):
+            if isinstance(val, (float)):
+                return f"{val:.{precision}f}" if precision else f"{val}"
+            return str(val) if val else default
+
+        # Create rows using list comprehension
+        rows = [
+            ("Reduced sample size:", opts.get('nsamples')),
+            ("Reduced PDF sum:", stats.get('optimal_pdf_sum')),
+            ("Original PDF sum:", stats.get('original_pdf_sum')),
+            ("Divergence method:", opts.get('pdfcomp')),
+            ("Divergance avg:", stats.get('average_divergence')),
+            ("Divergence std:", stats.get('divergence_std')),
+            ("Number of cycles:", opts.get('cycles')),
+            ("Number of optimizations:", opts.get('opt_jobs')),
+        ]
+
+        # Build table rows using formatted strings
+        table_rows = "\n".join(
+            f"<tr><td>{label}</td><td>{fmt(value)}</td></tr>"
+            for label, value in rows
+        )
+
+        # Single formatted string with CSS
+        self.summary_html.value = f"""
+        <style>
+            .summary-table td:first-child {{ padding-right: 20px; }}
+            .summary-table td:last-child {{ 
+                text-align: right; 
+                font-family: monospace;
+                min-width: 80px;
+            }}
+        </style>
+        <table class="summary-table">
+            {table_rows}
+        </table>
+        """
+
+    @tl.observe('data')
+    def _observe_data(self, change):
+        """Handle data updates"""
+        self.disabled = change['new'] is None
+        if change['new']:
+            self._update_summary()
+            self._update_images() # You'll need to implement this for actual image
+    
+    @tl.observe("disabled")
+    def _observe_disabled(self, change):
+        """Disable/enable interactive elements"""
+#         self.dl_reduced_sample.disabled = change["new"]
+        self.dl_report.disabled = change["new"]
+        
+    def _on_download(self, _=None):
+        """Placeholder download handler"""
+        print("Download functionality not implemented yet")
+        
+    def _update_images(self):
+        """Placeholder for image generation logic"""
+        # This would generate actual density plots from the data
+        # For now keeping placeholder images
+        pass    

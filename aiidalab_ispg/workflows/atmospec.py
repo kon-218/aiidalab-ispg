@@ -86,6 +86,54 @@ def format_selected_indices(raw_indices):
     """Extract the list of indices from a Dict node."""
     return List(list=raw_indices["indices"])
 
+@calcfunction
+def format_repsample_output(results):
+    """extract repsample output from node"""
+    return results["stdout"]
+
+@calcfunction
+def parse_repsample_output(raw_output: SinglefileData) -> Dict:
+    """Parse representative sampling output into structured data"""
+    import re
+    
+    content = raw_output.get_content()
+    parsed = {
+        "options": {"cycles": None, "pdfcomp": None, "nsamples": None},
+        "statistics": {
+            "original_pdf_sum": None, "average_divergence": None,
+            "divergence_std": None, "minimum_divergence": None,
+            "optimal_pdf_sum": None
+        },
+        "performance": {"wall_time_s": None}
+    }
+
+    # Combined regex pattern for all targets
+    patterns = {
+        r"nsamples\s+(\d+)":("options", "nsamples", int),
+        r"cycles\s+(\d+)": ("options", "cycles", int),
+        r"pdfcomp\s+(\w+)": ("options", "pdfcomp", str),
+        r"original PDF sum ([\d\.]+)": ("statistics", "original_pdf_sum", float),
+        r"average divergence ([\d\.]+)": ("statistics", "average_divergence", float),
+        r"divergence std ([\d\.]+)": ("statistics", "divergence_std", float),
+        r"minimum divergence: ([\d\.]+)": ("statistics", "minimum_divergence", float),
+        r"optimal PDF sum ([\d\.]+)": ("statistics", "optimal_pdf_sum", float),
+        r"ncores\s+(\d+)":("options", "opt_jobs", int),
+        r"wall time (\d+) s": ("performance", "wall_time_s", int)
+    }
+
+    for line in content.split('\n'):
+        for pattern, (section, key, conv) in patterns.items():
+            if match := re.search(pattern, line):
+                parsed[section][key] = conv(match.group(1))
+                break  # Move to next line after match
+
+    return Dict(parsed)
+
+@calcfunction
+def aggregate_repsample_results(**conformer_outputs) -> Dict:
+    """Aggregate parsed representative sampling results from multiple conformers"""
+    return Dict({k: v.get_dict() for k, v in conformer_outputs.items()})
+
 class RepSampleWorkChain(WorkChain):
     """WorkChain for running representative sampling using repre_sample_2D."""
 
@@ -110,6 +158,7 @@ class RepSampleWorkChain(WorkChain):
 
         # Outputs
         spec.output('selected_indices', valid_type=List)
+        spec.output('repsample_output')
         
         # Outline
         spec.outline(
@@ -235,6 +284,8 @@ class RepSampleWorkChain(WorkChain):
             self.ctx.rep_geoms_file = results[geom_files[0]].get_content()
 
             self.report("Representative sampling completed successfully.")
+            
+            self.out("repsample_output", results["stdout"])
         
         except Exception as e:
             self.report(f"Representative sampling failed with error: {str(e)}")
@@ -353,6 +404,13 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             required=False,
             help="Indices of geometries selected by representative sampling."
         )
+        spec.output(
+            "repsample_results",
+            valid_type=Dict,
+            required=False,
+            help="Results for representative sampling"
+        )
+            
         spec.outline(
             if_(cls.should_optimize)(
                 cls.optimize,
@@ -464,21 +522,42 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
 
         return ToContext(repsample_calc=repsample_calc)
 
+#     def inspect_repsample(self):
+#         """Check the results of representative sampling."""
+#         if not self.ctx.repsample_calc.is_finished_ok:
+#             self.report("Representative sampling failed")
+#             return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
+
+#         # Get selected geometry indices and store them
+#         self.out(
+#             "selected_representative_indices",
+#             self.ctx.repsample_calc.outputs.selected_indices
+#         )
+#         self.report(
+#             f"Representative sampling selected geometries: "
+#             f"{self.ctx.repsample_calc.outputs.selected_indices.get_list()}"
+#         )
+        
+#         # Get repsample outputs and store them
+#         self.out(
+#             "repsample_output",
+#             self.ctx.repsample_calc.outputs.repsample_output
+#         )
+#         self.report(
+#             f"Representative sampling output: "
+#             f"{self.ctx.repsample_calc.outputs.repsample_output.get_content()}"
+#         )
     def inspect_repsample(self):
-        """Check the results of representative sampling."""
+        """Check and store parsed results"""
         if not self.ctx.repsample_calc.is_finished_ok:
-            self.report("Representative sampling failed")
             return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
 
-        # Get selected geometry indices and store them
-        self.out(
-            "selected_representative_indices",
-            self.ctx.repsample_calc.outputs.selected_indices
-        )
-        self.report(
-            f"Representative sampling selected geometries: "
-            f"{self.ctx.repsample_calc.outputs.selected_indices.get_list()}"
-        )
+        # Get and parse output
+        raw_output = self.ctx.repsample_calc.outputs.repsample_output
+        parsed = parse_repsample_output(raw_output)
+        
+        self.out("repsample_results", parsed)
+        self.report(f"Stored parsed repsample results: {parsed.get_dict()}")
         
     def excite_selected_geoms(self):
         """
@@ -620,6 +699,12 @@ class AtmospecWorkChain(WorkChain):
             required=False,
             help="Minimized structures of all conformers",
         )
+        spec.output(
+            "repsample_results",
+            valid_type=Dict,
+            required=False,
+            help="agregated repsample results for each conformer.",
+        )
         spec.outline(
             cls.launch,
             cls.collect,
@@ -675,3 +760,12 @@ class AtmospecWorkChain(WorkChain):
                 arrays=array_data, **relaxed_structures
             )
             self.out("relaxed_structures", trajectory)
+
+        repsample_data = {}
+        for idx, outputs in enumerate(conf_outputs):
+            if "repsample_results" in outputs:
+                repsample_data[f"c{idx}"] = outputs.repsample_results
+
+        if repsample_data:
+            aggregated = aggregate_repsample_results(**repsample_data)
+            self.out("repsample_results", aggregated)
