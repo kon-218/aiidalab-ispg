@@ -9,7 +9,7 @@ import traitlets
 
 from aiida.engine import ProcessState, run_get_node, submit
 from aiida.manage import get_manager
-from aiida.orm import Bool, load_code, load_node
+from aiida.orm import Bool, Int, load_code, load_node
 from aiida.plugins import WorkflowFactory
 
 from .input_widgets import (
@@ -41,9 +41,10 @@ class AtmospecParameters(OptimizationParameters):
     nwigner: int
     wigner_low_freq_thr: float
     rep_sampling: bool
-    num_cycles: int
     num_samples: int
     exploratory_method: str
+    num_cycles: int
+    opt_jobs:int
 
 
 DEFAULT_ATMOSPEC_PARAMETERS = AtmospecParameters(
@@ -60,9 +61,10 @@ DEFAULT_ATMOSPEC_PARAMETERS = AtmospecParameters(
     nwigner=0,
     wigner_low_freq_thr=100.0,
     rep_sampling=True,
-    num_cycles=1200,
     num_samples=10,
     exploratory_method="ZIndo/S",
+    num_cycles=10,
+    opt_jobs=100
 )
 
 
@@ -205,6 +207,7 @@ class SubmitAtmospecAppWorkChainStep(SubmitWorkChainStepBase):
         self.repsample_settings.num_cycles.value = parameters.num_cycles
         self.repsample_settings.sample_size.value = parameters.num_samples
         self.repsample_settings.exploratory_method.value = parameters.exploratory_method
+        self.repsample_settings.opt_jobs.value = parameters.opt_jobs
 
         # Infer the value of the gs_sync checkbox
         if (
@@ -235,6 +238,7 @@ class SubmitAtmospecAppWorkChainStep(SubmitWorkChainStepBase):
             num_cycles=self.repsample_settings.num_cycles.value,
             num_samples=self.repsample_settings.sample_size.value,
             exploratory_method=self.repsample_settings.exploratory_method.value,
+            opt_jobs=self.repsample_settings.opt_jobs.value,
         )
 
     @traitlets.observe("process")
@@ -398,6 +402,19 @@ class SubmitAtmospecAppWorkChainStep(SubmitWorkChainStepBase):
         else:
             msg = f"Excited method {bp.excited_method} not implemented"
             raise NotImplementedError(msg)
+            
+        # Repsample parameters if needed
+        exploratory_parameters = None
+        if bp.rep_sampling:
+            exploratory_parameters = self._add_zindo_orca_params(
+                base_orca_parameters,
+                basis="def2-SVP", # Use for now
+                method=bp.exploratory_method,
+                nroots=Int(1) # Fix later
+            )
+            builder.nsamples = Int(bp.num_samples)
+            builder.cycles = Int(bp.num_cycles)
+            builder.opt_jobs = Int(bp.opt_jobs)
 
         builder.optimize = bp.optimize
         builder.rep_sample = Bool(bp.rep_sampling)
@@ -421,6 +438,14 @@ class SubmitAtmospecAppWorkChainStep(SubmitWorkChainStepBase):
         if bp.excited_method != ExcitedStateMethod.CCSD:
             builder.exc.orca.metadata.options.resources["tot_num_mpiprocs"] = 1
             builder.exc.orca.metadata.options.resources["num_mpiprocs_per_machine"] = 1
+        
+        if exploratory_parameters:    
+            builder.exp_exc.orca.parameters = exploratory_parameters
+            builder.exp_exc.orca.metadata = deepcopy(metadata)
+            builder.exp_exc.orca.metadata.options.resources["tot_num_mpiprocs"] = 1            
+            builder.exp_exc.orca.metadata.options.resources["num_mpiprocs_per_machine"] = 1
+            builder.exp_exc.clean_workfdir = Bool(True)
+            builder.exp_exc.orca.metadata.description = "ORCA exploratory ZINDO calculation"
 
         # Fetch GBW file from optimization step, to be used as a guess
         # for subsequent excited state calculations.

@@ -303,9 +303,10 @@ class RepresentativeSamplingSettings(ipw.VBox):
         </div>"""
     )
 
-    _NUM_CYCLES_DEFAULT = 1200
     _NSAMPLES_DEFAULT = 10
     _EXP_METHOD_DEFAULT = "ZIndo/S"
+    _NUM_CYCLES_DEFAULT = 100
+    _OPT_JOBS_DEFAULT = 10
 
     def __init__(self):
         style = {"description_width": "initial"}
@@ -318,20 +319,12 @@ class RepresentativeSamplingSettings(ipw.VBox):
             indent=False,
             layout=layout,
         )
-        self.enable_rep_sampling.observe(self._observe_enable_rep_sampling, "value")
+        self.enable_rep_sampling.observe(self._on_checkbox_toggle, "value")
 
         # Representative Sampling settings
-        self.num_cycles = ipw.IntText(
-            description="Number of annealing cycles",
-            value=self._NUM_CYCLES_DEFAULT,  # Default value
-            style=style,
-            layout=layout,
-            disabled=True,  # Initially disabled
-        )
-
         self.sample_size = ipw.IntText(
             description="Reduced sample size",
-            value=self._NSAMPLES_DEFAULT,  # Default value
+            value=self._NSAMPLES_DEFAULT,
             style=style,
             layout=layout,
             disabled=True,  # Initially disabled
@@ -339,45 +332,66 @@ class RepresentativeSamplingSettings(ipw.VBox):
 
         self.exploratory_method = ipw.Text(
             description="Exp. method",
-            value=self._EXP_METHOD_DEFAULT,  # Default value
+            value=self._EXP_METHOD_DEFAULT,
+            style=style,
+            layout=layout,
+            disabled=True,  # Initially disabled
+        )
+        
+        self.num_cycles = ipw.IntText(
+            description="Number of annealing cycles",
+            value=self._NUM_CYCLES_DEFAULT,
+            style=style,
+            layout=layout,
+            disabled=True,  # Initially disabled
+        )
+        
+        self.opt_jobs = ipw.IntText(
+            description="Number of repetitions",
+            value=self._OPT_JOBS_DEFAULT,
             style=style,
             layout=layout,
             disabled=True,  # Initially disabled
         )
 
-        # Update the super().__init__ call to include all the widgets
+        # Initialize the VBox with all widgets
         super().__init__(
             [
                 self.title,
                 self.enable_rep_sampling,
-                self.num_cycles,
                 self.sample_size,
                 self.exploratory_method,
+                self.num_cycles,
+                self.opt_jobs,
             ]
         )
 
-    def _observe_enable_rep_sampling(self, change):
-        """Enable/disable representative sampling settings based on checkbox value."""
+    def _on_checkbox_toggle(self, change):
+        """Enable/disable widgets based on checkbox value."""
         enabled = change["new"]
-        self.num_cycles.disabled = not enabled
         self.sample_size.disabled = not enabled
         self.exploratory_method.disabled = not enabled
+        self.num_cycles.disabled = not enabled
+        self.opt_jobs.disabled = not enabled
 
     @tl.observe("disabled")
-    def _observer_disabled(self, change):
-        """Enable/disable all representative sampling widgets based on the 'disabled' trait."""
+    def _observe_disabled(self, change):
+        """Globally enable/disable all widgets, including the checkbox."""
         is_disabled = change["new"]
-        self.num_cycles.disabled = is_disabled
-        self.sample_size.disabled = is_disabled
-        self.exploratory_method.disabled = is_disabled
         self.enable_rep_sampling.disabled = is_disabled
+        all_disabled = is_disabled or not self.enable_rep_sampling.value
+        self.sample_size.disabled = all_disabled
+        self.exploratory_method.disabled = all_disabled
+        self.num_cycles.disabled = all_disabled
+        self.opt_jobs.disabled = all_disabled
 
     def reset(self):
         """Reset all settings to their default values."""
         self.num_cycles.value = self._NUM_CYCLES_DEFAULT
         self.sample_size.value = self._NSAMPLES_DEFAULT
         self.exploratory_method.value = self._EXP_METHOD_DEFAULT
-        self.enable_rep_sampling.value = False  # Default is disabled
+        self.opt_jobs.value = self._OPT_JOBS_DEFAULT
+        self.enable_rep_sampling.value = False  # Reset to unchecked
 
 
 class CodeSettings(ipw.VBox):

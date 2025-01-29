@@ -98,7 +98,7 @@ def parse_repsample_output(raw_output: SinglefileData) -> Dict:
     
     content = raw_output.get_content()
     parsed = {
-        "options": {"cycles": None, "pdfcomp": None, "nsamples": None},
+        "options": {"cycles": None, "pdfcomp": None, "nsamples": None, "opt_jobs": None},
         "statistics": {
             "original_pdf_sum": None, "average_divergence": None,
             "divergence_std": None, "minimum_divergence": None,
@@ -117,7 +117,7 @@ def parse_repsample_output(raw_output: SinglefileData) -> Dict:
         r"divergence std ([\d\.]+)": ("statistics", "divergence_std", float),
         r"minimum divergence: ([\d\.]+)": ("statistics", "minimum_divergence", float),
         r"optimal PDF sum ([\d\.]+)": ("statistics", "optimal_pdf_sum", float),
-        r"ncores\s+(\d+)":("options", "opt_jobs", int),
+        r"njobs\s+(\d+)":("options", "opt_jobs", int),
         r"wall time (\d+) s": ("performance", "wall_time_s", int)
     }
 
@@ -355,6 +355,11 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             namespace="exc",
             exclude=["orca.structure", "orca.code"],
         )
+        spec.expose_inputs(
+            OrcaExcitationWorkChain, 
+            namespace="exp_exc", 
+            exclude=["orca.structure", "orca.code"]
+        )
         spec.input("structure", valid_type=(StructureData, TrajectoryData))
         spec.input("code", valid_type=Code)
         # Whether to perform geometry optimization
@@ -380,6 +385,10 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             default=lambda: Float(10),
             serializer=to_aiida_type,
         )
+        spec.input("sample_size", valid_type=Int, default=lambda: Int(10))
+        spec.input("cycles", valid_type=Int, default=lambda: Int(100))
+        spec.input("opt_jobs", valid_type=Int, default=lambda: Int(32))
+        spec.input("exploratory_method", valid_type=Str, default=lambda: Str("ZINDO"))
         spec.output(
             "franck_condon_excitations",
             valid_type=Dict,
@@ -509,10 +518,10 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             "excitation_data": List(input_data).store(),
             "n_samples": Int(1200),
             "n_states": Int(1),  # Number of excited states
-            "sample_size": Int(10),  # Number of geometries to select
-            "cycles": Int(100),
+            "sample_size": self.inputs.sample_size,  # Number of geometries to select
+            "cycles": self.inputs.cycles,
             "cores": Int(1),
-            "opt_jobs": Int(2),
+            "opt_jobs": self.inputs.opt_jobs,
             "weight_by_significance": Bool(True),
             "pdf_comparison": Str("KLdiv"),
         }
@@ -613,7 +622,13 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             gbw_file = SinglefileData(handler)
             inputs.orca.file = {"gbw": gbw_file}
         inputs.orca.parameters = add_orca_wf_guess(inputs.orca.parameters)
-
+        
+        if self.inputs.rep_sample is True:
+            # Use the exploratory method if representative sampling is enabled.
+            self.report("Using exploratory method for Wigner excitations")
+            inputs.orca.parameters = self.inputs.exp_exc.orca.parameters
+            inputs = self.exposed_inputs(OrcaExcitationWorkChain, namespace="exp_exc", agglomerate=False) # Use exp_exc namespace
+         
         for i in self.ctx.wigner_structures.get_stepids():
             inputs.orca.structure = pick_structure_from_trajectory(
                 self.ctx.wigner_structures, Int(i)
@@ -621,6 +636,35 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             calc = self.submit(OrcaExcitationWorkChain, **inputs)
             calc.label = f"wigner-excitation-{i}"
             self.to_context(wigner_calcs=append_(calc))
+            
+    def wigner_excite(self):
+        """Calculate excited states for Wigner geometries."""
+        inputs = self.exposed_inputs(
+            OrcaExcitationWorkChain, namespace="exc", agglomerate=False
+        )
+        inputs.orca.code = self.inputs.code
+
+        # Pass in SCF wavefunction from minimum geometry
+        with self.ctx.calc_opt.outputs.retrieved.base.repository.open(
+            "aiida.gbw", "rb"
+        ) as handler:
+            gbw_file = SinglefileData(handler)
+            inputs.orca.file = {"gbw": gbw_file}
+        inputs.orca.parameters = add_orca_wf_guess(inputs.orca.parameters)
+
+        if self.inputs.rep_sample and self.inputs.exp_exc is not None:
+            # Use the exploratory method if representative sampling is enabled.
+            self.report("Using exploratory method for Wigner excitations")
+            inputs.orca.parameters = self.inputs.exp_exc.orca.parameters
+        
+        for i in self.ctx.wigner_structures.get_stepids():
+            inputs.orca.structure = pick_structure_from_trajectory(
+                self.ctx.wigner_structures, Int(i)
+            )
+            calc = self.submit(OrcaExcitationWorkChain, **inputs)
+            calc.label = f"wigner-excitation-{i}"
+            self.to_context(wigner_calcs=append_(calc))
+
 
     def optimize(self):
         """Optimize geometry"""
