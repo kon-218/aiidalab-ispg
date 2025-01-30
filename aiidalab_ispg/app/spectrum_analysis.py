@@ -555,11 +555,12 @@ class RepsampleAnalysisWidget(ipw.VBox):
 
         # Create rows using list comprehension
         rows = [
-            ("Reduced sample size:", opts.get('nsamples')),
+            ("Exploratory sample size:", opts.get('nsamples')),
+            ("Reduced sample size:", opts.get('subset')),
             ("Reduced PDF sum:", stats.get('optimal_pdf_sum')),
             ("Original PDF sum:", stats.get('original_pdf_sum')),
             ("Divergence method:", opts.get('pdfcomp')),
-            ("Divergance avg:", stats.get('average_divergence')),
+            ("Divergence avg:", stats.get('average_divergence')),
             ("Divergence std:", stats.get('divergence_std')),
             ("Number of cycles:", opts.get('cycles')),
             ("Number of optimizations:", opts.get('opt_jobs')),

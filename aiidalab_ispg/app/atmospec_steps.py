@@ -62,9 +62,9 @@ DEFAULT_ATMOSPEC_PARAMETERS = AtmospecParameters(
     wigner_low_freq_thr=100.0,
     rep_sampling=True,
     num_samples=10,
-    exploratory_method="ZIndo/S",
+    exploratory_method="ZINDO/S",
     num_cycles=10,
-    opt_jobs=100
+    opt_jobs=10,
 )
 
 

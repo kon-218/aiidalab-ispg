@@ -110,6 +110,7 @@ def parse_repsample_output(raw_output: SinglefileData) -> Dict:
     # Combined regex pattern for all targets
     patterns = {
         r"nsamples\s+(\d+)":("options", "nsamples", int),
+        r"subset\s+(\d+)":("options", "subset", int),
         r"cycles\s+(\d+)": ("options", "cycles", int),
         r"pdfcomp\s+(\w+)": ("options", "pdfcomp", str),
         r"original PDF sum ([\d\.]+)": ("statistics", "original_pdf_sum", float),
@@ -419,6 +420,12 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             required=False,
             help="Results for representative sampling"
         )
+        spec.output(
+            "selected_excitations",
+            valid_type=List,
+            required=False,
+            help="Excitations from representative sampled geometries.",
+        )
             
         spec.outline(
             if_(cls.should_optimize)(
@@ -435,6 +442,7 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
                     cls.repsample,
                     cls.inspect_repsample,
                     cls.excite_selected_geoms,
+                    cls.inspect_selected_excitations,
                 ),
             ),
         )
@@ -531,31 +539,6 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
 
         return ToContext(repsample_calc=repsample_calc)
 
-#     def inspect_repsample(self):
-#         """Check the results of representative sampling."""
-#         if not self.ctx.repsample_calc.is_finished_ok:
-#             self.report("Representative sampling failed")
-#             return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
-
-#         # Get selected geometry indices and store them
-#         self.out(
-#             "selected_representative_indices",
-#             self.ctx.repsample_calc.outputs.selected_indices
-#         )
-#         self.report(
-#             f"Representative sampling selected geometries: "
-#             f"{self.ctx.repsample_calc.outputs.selected_indices.get_list()}"
-#         )
-        
-#         # Get repsample outputs and store them
-#         self.out(
-#             "repsample_output",
-#             self.ctx.repsample_calc.outputs.repsample_output
-#         )
-#         self.report(
-#             f"Representative sampling output: "
-#             f"{self.ctx.repsample_calc.outputs.repsample_output.get_content()}"
-#         )
     def inspect_repsample(self):
         """Check and store parsed results"""
         if not self.ctx.repsample_calc.is_finished_ok:
@@ -590,7 +573,7 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             calc = self.submit(OrcaExcitationWorkChain, **inputs)
             calc.label = f"repsample-excitation-{idx}"
             self.to_context(repsample_exc=append_(calc))
-            
+    
     def wigner_sampling(self):
         self.report(f"Generating {self.inputs.nwigner.value} Wigner geometries")
         n_low_freq_vibs = 0
@@ -710,6 +693,19 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
         ]
         self.report("Wigner excitation sucessfull")
         self.out("wigner_excitations", List(all_wigner_data).store())
+        
+    def inspect_selected_excitations(self):
+        """Check whether all selected excitations succeeded"""
+        for calc in self.ctx.repsample_exc:
+            if not calc.is_finished_ok:
+                self.report("Selected geometry excitation failed :-(")
+                return self.exit_codes.ERROR_EXCITATION_FAILED
+
+        all_selected_data = [
+            wc.outputs.excitations.get_dict() for wc in self.ctx.repsample_exc
+        ]
+        self.report("Selected excitations successful")
+        self.out("selected_excitations", List(all_selected_data).store())
 
     def should_optimize(self):
         return self.inputs.optimize.value
@@ -772,17 +768,15 @@ class AtmospecWorkChain(WorkChain):
 
         conf_outputs = [wc.outputs for wc in self.ctx.confs]
 
-        # Combine all spectra data
-        if self.inputs.optimize and self.inputs.nwigner > 0:
-            data = {
-                str(i): outputs.wigner_excitations
-                for i, outputs in enumerate(conf_outputs)
-            }
-        else:
-            data = {
-                str(i): [outputs.franck_condon_excitations.get_dict()]
-                for i, outputs in enumerate(conf_outputs)
-            }
+        # Modified data collection logic
+        data = {}
+        for i, outputs in enumerate(conf_outputs):
+            if "selected_excitations" in outputs:
+                data[str(i)] = outputs.selected_excitations
+            elif "wigner_excitations" in outputs:
+                data[str(i)] = outputs.wigner_excitations
+            else:
+                data[str(i)] = [outputs.franck_condon_excitations.get_dict()]
 
         all_results = run(ConcatInputsToList, ns=data)
         self.out("spectrum_data", all_results["output"])
