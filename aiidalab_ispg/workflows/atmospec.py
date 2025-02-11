@@ -1,6 +1,4 @@
 """Base work chain to run an ORCA calculation"""
-
-# Not sure if this is needed? Can we use self.run()?
 from aiida.engine import (
     ExitCode,
     ToContext,
@@ -19,12 +17,21 @@ from aiida.orm import (
     SinglefileData,
     StructureData,
     TrajectoryData,
+    FolderData,
     to_aiida_type,
+    Str
 )
 from aiida.plugins import CalculationFactory, DataFactory, WorkflowFactory
+from aiida.engine import calcfunction
 
+import pathlib
+from aiida_shell import launch_shell_job
+import tempfile
+import subprocess
+import os
 from .harmonic_wigner import generate_wigner_structures
 from .optimization import RobustOptimizationWorkChain
+#from ..app import repre_sample_2D
 from .utils import (
     ConcatInputsToList,
     add_orca_wf_guess,
@@ -32,6 +39,7 @@ from .utils import (
     pick_structure_from_trajectory,
     structures_to_trajectory,
 )
+import math
 
 Code = DataFactory("core.code.installed")
 OrcaCalculation = CalculationFactory("orca.orca")
@@ -54,22 +62,326 @@ class OrcaExcitationWorkChain(OrcaBaseWorkChain):
             help="Excitation energies and oscillator strengths from a single-point excitations",
         )
 
-    def extract_transitions_from_orca_output(self, orca_output_params):
+    def extract_transitions_from_orca_output(self, orca_output_params, dipoles):
         return {
             "oscillator_strengths": orca_output_params["etoscs"],
             # Orca returns excited state energies in cm^-1
             # Perhaps we should do the conversion here,
             # to make this less ORCA specific.
             "excitation_energies_cm": orca_output_params["etenergies"],
+            "transition_dipoles": dipoles
         }
 
     @process_handler(exit_codes=ExitCode(0), priority=600)
     def add_excitation_output(self, calculation):
         """Extract excitation energies and osc. strengths into a separate output node"""
+        # Parse dipole moments from the output file
+        try:
+            retrieved = calculation.outputs.retrieved
+            dipole_moments = self.parse_dipole_moments(retrieved)
+        except Exception as e:
+            self.report(f"Failed to parse dipole moments: {str(e)}")
+            dipole_moments = []
+
         transitions = self.extract_transitions_from_orca_output(
-            calculation.outputs.output_parameters
+            calculation.outputs.output_parameters,
+            dipole_moments
         )
+
         self.out("excitations", Dict(transitions).store())
+        
+    def parse_dipole_moments(self, retrieved_folder):
+        """Parse TX, TY, TZ from the ORCA output file."""
+        import re
+
+        dipole_moments = []
+        output_filename = 'aiida.out'
+
+        try:
+            with retrieved_folder.open(output_filename, 'r') as f:
+                content = f.read()
+        except IOError:
+            self.report(f"Could not find {output_filename} in retrieved folder.")
+            return dipole_moments
+
+        lines = content.split('\n')
+        in_section = False
+        pattern = re.compile(r'^\s*\d+\s+\d+\.\d+\s+\d+\.\d+\s+\d+\.\d+\s+\d+\.\d+\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s*$')
+
+        for line in lines:
+            if 'ABSORPTION SPECTRUM VIA TRANSITION ELECTRIC DIPOLE MOMENTS' in line:
+                in_section = True
+                continue
+            if in_section:
+                if line.strip() == '':
+                    in_section = False
+                    continue
+                match = pattern.match(line)
+                if match:
+                    tx = float(match.group(1))
+                    ty = float(match.group(2))
+                    tz = float(match.group(3))
+                    dipole_moments.append((tx, ty, tz))
+
+        return dipole_moments
+
+
+@calcfunction
+def format_selected_indices(raw_indices):
+    """Extract the list of indices from a Dict node."""
+    return List(list=raw_indices["indices"])
+
+@calcfunction
+def format_repsample_output(results):
+    """extract repsample output from node"""
+    return results["stdout"]
+
+@calcfunction
+def parse_repsample_output(raw_output: SinglefileData) -> Dict:
+    """Parse representative sampling output into structured data"""
+    import re
+    
+    # Empty data structure
+    content = raw_output.get_content()
+    parsed = {
+        "options": {"cycles": None, "pdfcomp": None, "nsamples": None, "opt_jobs": None},
+        "statistics": {
+            "original_pdf_sum": None, "average_divergence": None,
+            "divergence_std": None, "minimum_divergence": None,
+            "optimal_pdf_sum": None
+        },
+        "performance": {"wall_time_s": None}
+    }
+
+    # Combined regex pattern for all targets
+    patterns = {
+        r"nsamples\s+(\d+)":("options", "nsamples", int),
+        r"subset\s+(\d+)":("options", "subset", int),
+        r"cycles\s+(\d+)": ("options", "cycles", int),
+        r"pdfcomp\s+(\w+)": ("options", "pdfcomp", str),
+        r"original PDF sum ([\d\.]+)": ("statistics", "original_pdf_sum", float),
+        r"average divergence ([\d\.]+)": ("statistics", "average_divergence", float),
+        r"divergence std ([\d\.]+)": ("statistics", "divergence_std", float),
+        r"minimum divergence: ([\d\.]+)": ("statistics", "minimum_divergence", float),
+        r"optimal PDF sum ([\d\.]+)": ("statistics", "optimal_pdf_sum", float),
+        r"njobs\s+(\d+)":("options", "opt_jobs", int),
+        r"wall time (\d+) s": ("performance", "wall_time_s", int)
+    }
+
+    # Fill data matching regex
+    for line in content.split('\n'):
+        for pattern, (section, key, conv) in patterns.items():
+            if match := re.search(pattern, line):
+                parsed[section][key] = conv(match.group(1))
+                break  
+
+    return Dict(parsed)
+
+@calcfunction
+def aggregate_repsample_results(**conformer_outputs) -> Dict:
+    """Aggregate parsed representative sampling results from multiple conformers"""
+    return Dict({k: v.get_dict() for k, v in conformer_outputs.items()})
+
+class RepSampleWorkChain(WorkChain):
+    """WorkChain for running representative sampling using repre_sample_2D."""
+
+    @classmethod
+    def define(cls, spec):
+        super().define(spec)
+        
+        # Inputs
+        spec.input('excitation_data', valid_type=List,
+                   help='List of tuples containing (energy, transition dipole moments)')
+        spec.input('n_samples', valid_type=Int,
+                   help='Total number of geometries')
+        spec.input('n_states', valid_type=Int,
+                   help='Number of excited states per geometry')
+        spec.input('sample_size', valid_type=Int,
+                   help='Number of geometries to select')
+        spec.input('cycles', valid_type=Int, default=lambda: Int(2000))
+        spec.input('cores', valid_type=Int, default=lambda: Int(16))
+        spec.input('opt_jobs', valid_type=Int, default=lambda: Int(32))
+        spec.input('weight_by_significance', valid_type=Bool, default=lambda: Bool(True))
+        spec.input('pdf_comparison', valid_type=Str, default=lambda: Str('KLdiv'))
+
+        # Outputs
+        spec.output('selected_indices', valid_type=List)
+        spec.output('repsample_output')
+        
+        # Outline
+        spec.outline(
+            cls.setup_calculation,
+            cls.run_representative_sampling,
+            cls.extract_geoms,
+            # cls.extract_pdfs
+        )
+        
+        # Exit codes
+        spec.exit_code(
+            404,
+            "ERROR_MISSING_SCRIPT",
+            "The repre_sample_2D.py script was not found or is not executable.",
+        )
+        spec.exit_code(
+            405,
+            'ERROR_REPRESENTATIVE_SAMPLING_FAILED',
+            "The representative sampling calculation failed."
+        )
+        
+        spec.exit_code(
+        406,
+        "ERROR_EXTRACTION_FAILED",
+        "Failed to extract geometry indices from results"
+    )
+        
+    def setup_calculation(self):
+        """Prepare input file for repre_sample_2D by writing excitation data to file."""
+        self.report("Setting up representative sampling calculation")
+        
+#         if len(self.inputs.excitation_data) < self.inputs.n_samples.value * self.inputs.n_states.value:
+#             self.report("Error: Not enough transitions in excitation_data for the requested sampling.")
+#             return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
+
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
+            for energy, tdm in self.inputs.excitation_data:
+                f.write(f"{energy:.6f}\n")
+                f.write(f"{tdm[0]:.6f} {tdm[1]:.6f} {tdm[2]:.6f}\n")
+            self.ctx.input_file = f.name
+
+    def run_representative_sampling(self):
+        """
+        Runs the representative sampling calculation using repre_sample_2D.py
+        from the app directory via aiida-shell.
+        """
+        self.report("Running representative sampling with aiida-shell.")
+
+        script_path = "/home/jovyan/apps/aiidalab-ispg/aiidalab_ispg/workflows/repre_sample_2D.py"
+        if not os.path.isfile(script_path):
+            self.report(f"Error: repre_sample_2D.py script not found at {script_path}")
+            return self.exit_codes.ERROR_MISSING_SCRIPT
+
+        input_file_node = SinglefileData(file=self.ctx.input_file)
+
+        # Log input file path
+        self.report(f"Input file path: {self.ctx.input_file}")
+
+        # Log inputs for representative sampling
+        self.report(f"Inputs for representative sampling: n_samples={self.inputs.n_samples.value}, "
+                    f"n_states={self.inputs.n_states.value}, sample_size={self.inputs.sample_size.value}, "
+                    f"cycles={self.inputs.cycles.value}, cores={self.inputs.cores.value}, "
+                    f"opt_jobs={self.inputs.opt_jobs.value}")
+
+        try:
+            # Debugging: Report the input file contents and other arguments before launching
+            self.report(f"Input file path: {self.ctx.input_file}")
+
+            # Read the input file and report its contents (if it's a text file or similar)
+            with open(self.ctx.input_file, 'r') as f:
+                input_file_content = f.read()
+            self.report(f"Input file content:\n{input_file_content}")
+
+            self.report(f"Script path: {script_path}")
+            self.report(f"Arguments: -n {self.inputs.n_samples.value} -N {self.inputs.n_states.value} -S {self.inputs.sample_size.value} "
+                        f"-c {self.inputs.cycles.value} -j {self.inputs.cores.value} -J {self.inputs.opt_jobs.value} "
+                        f"--pdfcomp KLdiv {self.ctx.input_file}")
+            
+            
+            dirpath = pathlib.Path("./")
+            folder_data = FolderData(tree=dirpath.absolute())
+            
+            self.report(f"Output folder path {dirpath.absolute()}")
+            
+            # Launch represample
+            results, node = launch_shell_job(
+                "python",
+                arguments=('{script} -n {n_samples} -N {n_states} -S {sample_size} -c {cycles} -j {cores} -J {opt_jobs} -w --verbose --pdfcomp KLdiv {input_file}'),
+                nodes={
+                    'script': SinglefileData(script_path),
+                    'input_file': SinglefileData('/home/jovyan/apps/aiidalab-ispg/aiidalab_ispg/workflows/acrolein_input_file.txt'),
+                    'n_samples': Int(self.inputs.n_samples.value),
+                    'n_states': Int(self.inputs.n_states.value),
+                    'sample_size': Int(self.inputs.sample_size.value),
+                    'cycles': Int(self.inputs.cycles.value),
+                    'cores': Int(self.inputs.cores.value),
+                    'opt_jobs': Int(self.inputs.opt_jobs.value),
+                },
+                metadata={
+                    'options': {'redirect_stderr':True}
+                },
+                outputs=['absspec*']
+            )
+            
+            # Log available result keys
+            self.report(f"Available results keys: {list(results.keys())}")
+            
+            self.report(f"STDOUT: {results['stdout'].get_content()}")
+
+            # Store results in context
+            self.ctx.repsample_results = results
+            self.ctx.repsample_node = node
+
+            # Log available result keys
+            self.report(f"Available results keys: {list(results.keys())}")
+
+            # Find geometry file in results
+            geom_files = [key for key in results.keys() if key.endswith('_geoms_txt')]
+            if not geom_files:
+                self.report("Error: No geometry file found in results.")
+                return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
+
+            # Store geometry content in context
+            self.ctx.rep_geoms_file = results[geom_files[0]].get_content()
+
+            self.report("Representative sampling completed successfully.")
+            
+            self.out("repsample_output", results["stdout"])
+        
+        except Exception as e:
+            self.report(f"Representative sampling failed with error: {str(e)}")
+            return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
+            
+    def extract_geoms(self):
+        """Extract geometry indices from results"""
+        self.report("Extracting geometry indices from results")
+
+        try:
+            # Check if the geometry file exists in context
+            if "rep_geoms_file" not in self.ctx:
+                self.report("No geometry file found in context")
+                return self.exit_codes.ERROR_EXTRACTION_FAILED  # Use the new exit code
+
+            # Parse indices from file content
+            content = self.ctx.rep_geoms_file
+            indices = []
+            for line in content.strip().split("\n"):
+                if line.strip():
+                    try:
+                        indices.append(int(line.strip()))
+                    except ValueError as e:
+                        self.report(f"Invalid index format: {line.strip()}")
+                        continue
+
+            # Check if indices were found
+            if not indices:
+                self.report("No valid indices found in geometry file")
+                return self.exit_codes.ERROR_EXTRACTION_FAILED
+
+            # Store indices in context (remove debug line)
+            self.ctx.selected_indices = sorted(indices)
+            self.report(f"Found {len(indices)} geometry indices")
+            
+            # Debugging
+            self.ctx.selected_indices = [0,2]
+
+            # Create List node via calcfunction
+            indices_dict = Dict(dict={"indices": self.ctx.selected_indices})
+            selected_indices_node = format_selected_indices(indices_dict)
+            self.out("selected_indices", selected_indices_node)
+
+        except Exception as e:
+            self.report(f"Extraction failed: {str(e)}")
+            return self.exit_codes.ERROR_EXTRACTION_FAILED
+
 
 
 class OrcaWignerSpectrumWorkChain(WorkChain):
@@ -92,9 +404,14 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             namespace="exc",
             exclude=["orca.structure", "orca.code"],
         )
+        spec.expose_inputs(
+            OrcaExcitationWorkChain,
+            namespace="exp_exc",
+            exclude=["orca.structure", "orca.code"],
+            namespace_options={"required": False, "populate_defaults": False} 
+        )
         spec.input("structure", valid_type=(StructureData, TrajectoryData))
         spec.input("code", valid_type=Code)
-
         # Whether to perform geometry optimization
         spec.input(
             "optimize",
@@ -102,19 +419,26 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             default=lambda: Bool(True),
             serializer=to_aiida_type,
         )
-
+        spec.input(
+            "rep_sample",
+            valid_type=Bool,
+            default=lambda: Bool(True),
+            serializer=to_aiida_type,
+        )
         # Number of Wigner geometries (computed only when optimize==True)
         spec.input(
             "nwigner", valid_type=Int, default=lambda: Int(1), serializer=to_aiida_type
         )
-
         spec.input(
             "wigner_low_freq_thr",
             valid_type=Float,
             default=lambda: Float(10),
             serializer=to_aiida_type,
         )
-
+        spec.input("sample_size", valid_type=Int, default=lambda: Int(10))
+        spec.input("cycles", valid_type=Int, default=lambda: Int(100))
+        spec.input("opt_jobs", valid_type=Int, default=lambda: Int(32))
+        spec.input("exploratory_method", valid_type=Str, default=lambda: Str("ZINDO"))
         spec.output(
             "franck_condon_excitations",
             valid_type=Dict,
@@ -127,14 +451,31 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             include=["output_parameters", "relaxed_structure"],
             namespace_options={"required": False},
         )
-
         spec.output(
             "wigner_excitations",
             valid_type=List,
             required=False,
             help="Output parameters from all Wigner excited state calculation",
         )
-
+        spec.output(
+            "selected_representative_indices",
+            valid_type=List,
+            required=False,
+            help="Indices of geometries selected by representative sampling."
+        )
+        spec.output(
+            "repsample_results",
+            valid_type=Dict,
+            required=False,
+            help="Results for representative sampling"
+        )
+        spec.output(
+            "selected_excitations",
+            valid_type=List,
+            required=False,
+            help="Excitations from representative sampled geometries.",
+        )
+            
         spec.outline(
             if_(cls.should_optimize)(
                 cls.optimize,
@@ -146,6 +487,12 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
                 cls.wigner_sampling,
                 cls.wigner_excite,
                 cls.inspect_wigner_excitation,
+                if_(cls.should_run_repsample)(
+                    cls.repsample,
+                    cls.inspect_repsample,
+                    cls.excite_selected_geoms,
+                    cls.inspect_selected_excitations,
+                ),
             ),
         )
 
@@ -157,6 +504,11 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
         spec.exit_code(
             402, "ERROR_EXCITATION_FAILED", "excited state calculation failed"
         )
+        spec.exit_code(
+            403,
+            "ERROR_REPRESENTATIVE_SAMPLING_FAILED",
+            "Representative sampling failed to produce output."
+        )
 
     def excite(self):
         """Calculate excited states for a single geometry"""
@@ -164,17 +516,15 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             OrcaExcitationWorkChain, namespace="exc", agglomerate=False
         )
         inputs.orca.code = self.inputs.code
-
         if self.inputs.optimize:
             self.report("Calculating spectrum for optimized geometry")
             inputs.orca.structure = self.ctx.calc_opt.outputs.relaxed_structure
-
             # Pass in converged SCF wavefunction
             with self.ctx.calc_opt.outputs.retrieved.base.repository.open(
                 "aiida.gbw", "rb"
             ) as handler:
                 gbw_file = SinglefileData(handler)
-            inputs.orca.file = {"gbw": gbw_file}
+                inputs.orca.file = {"gbw": gbw_file}
             inputs.orca.parameters = add_orca_wf_guess(inputs.orca.parameters)
         else:
             self.report("Calculating spectrum for input geometry")
@@ -184,9 +534,82 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
         calc_exc.label = "franck-condon-excitation"
         return ToContext(calc_exc=calc_exc)
 
+    def repsample(self):
+        """Prepare input file for repre_sample_2D using transition dipole moments."""
+        self.report("Setting up representative sampling calculation")
+
+        excitation_data = []
+        for calc in self.ctx.wigner_calcs: 
+            if not calc.is_finished_ok:
+                self.report(f"Skipping failed Wigner calculation {calc.pk}")
+                continue
+
+            data = calc.outputs.excitations.get_dict()
+            energies = data["excitation_energies_cm"]
+            energies_ev = [e * 1.23984193e-4 for e in energies]  # Convert cm^-1 to eV
+            dipoles = data["transition_dipoles"]
+
+            for energy, dipole in zip(energies_ev, dipoles):
+                excitation_data.append((energy, dipole))
+
+        if not excitation_data:
+            self.report("No valid excitation data available for representative sampling")
+            return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
+
+        # Create inputs for RepSampleWorkChain
+        inputs = {
+            "excitation_data": List(excitation_data).store(),
+            #"n_samples": Int(len(excitation_data)),
+            "n_samples": Int(1200),
+            "n_states": Int(1),
+            "sample_size": self.inputs.sample_size,
+            "cycles": self.inputs.cycles,
+            #"cores": self.inputs.cores,
+            "cores": Int(1),
+            "opt_jobs": self.inputs.opt_jobs,
+            #"pdf_comparison": self.inputs.pdf_comparison,
+        }
+
+        repsample_calc = self.submit(RepSampleWorkChain, **inputs)
+        return ToContext(repsample_calc=repsample_calc)
+
+    def inspect_repsample(self):
+        """Check and store parsed repsample results"""
+        if not self.ctx.repsample_calc.is_finished_ok:
+            return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
+
+        # Get and parse output
+        raw_output = self.ctx.repsample_calc.outputs.repsample_output
+        parsed = parse_repsample_output(raw_output)
+        
+        self.out("repsample_results", parsed)
+        self.report(f"Stored parsed repsample results: {parsed.get_dict()}")
+        
+    def excite_selected_geoms(self):
+        """
+        Run excitation calculations for geometries selected by representative sampling.
+        """
+        self.report("Starting excitation of selected geometries")
+
+        inputs = self.exposed_inputs(OrcaExcitationWorkChain, namespace="exc", agglomerate=False)
+        inputs.orca.code = self.inputs.code
+
+        # Pass in SCF wavefunction from minimum geometry
+        with self.ctx.calc_opt.outputs.retrieved.base.repository.open(
+            "aiida.gbw", "rb"
+        ) as handler:
+            gbw_file = SinglefileData(handler)
+            inputs.orca.file = {"gbw": gbw_file}
+        inputs.orca.parameters = add_orca_wf_guess(inputs.orca.parameters)
+        
+        for idx in self.ctx.repsample_calc.outputs.selected_indices:
+            inputs.orca.structure = pick_structure_from_trajectory(self.ctx.wigner_structures, Int(idx))
+            calc = self.submit(OrcaExcitationWorkChain, **inputs)
+            calc.label = f"repsample-excitation-{idx}"
+            self.to_context(repsample_exc=append_(calc))
+    
     def wigner_sampling(self):
         self.report(f"Generating {self.inputs.nwigner.value} Wigner geometries")
-
         n_low_freq_vibs = 0
         for freq in self.ctx.calc_opt.outputs.output_parameters["vibfreqs"]:
             if freq < self.inputs.wigner_low_freq_thr:
@@ -208,13 +631,21 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             OrcaExcitationWorkChain, namespace="exc", agglomerate=False
         )
         inputs.orca.code = self.inputs.code
+
         # Pass in SCF wavefunction from minimum geometry
         with self.ctx.calc_opt.outputs.retrieved.base.repository.open(
             "aiida.gbw", "rb"
         ) as handler:
             gbw_file = SinglefileData(handler)
-        inputs.orca.file = {"gbw": gbw_file}
+            inputs.orca.file = {"gbw": gbw_file}
         inputs.orca.parameters = add_orca_wf_guess(inputs.orca.parameters)
+        
+        if self.inputs.rep_sample is True:
+            # Use the exploratory method if representative sampling is enabled.
+            self.report("Using exploratory method for Wigner excitations")
+            inputs.orca.parameters = self.inputs.exp_exc.orca.parameters
+            inputs = self.exposed_inputs(OrcaExcitationWorkChain, namespace="exp_exc", agglomerate=False) # Use exp_exc namespace
+         
         for i in self.ctx.wigner_structures.get_stepids():
             inputs.orca.structure = pick_structure_from_trajectory(
                 self.ctx.wigner_structures, Int(i)
@@ -223,6 +654,7 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             calc.label = f"wigner-excitation-{i}"
             self.to_context(wigner_calcs=append_(calc))
 
+
     def optimize(self):
         """Optimize geometry"""
         inputs = self.exposed_inputs(
@@ -230,7 +662,6 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
         )
         inputs.orca.structure = self.inputs.structure
         inputs.orca.code = self.inputs.code
-
         calc_opt = self.submit(RobustOptimizationWorkChain, **inputs)
         calc_opt.label = "optimization"
         return ToContext(calc_opt=calc_opt)
@@ -240,7 +671,6 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
         if not self.ctx.calc_opt.is_finished_ok:
             self.report("Optimization failed :-(")
             return self.exit_codes.ERROR_OPTIMIZATION_FAILED
-
         self.out_many(
             self.exposed_outputs(
                 self.ctx.calc_opt,
@@ -264,11 +694,24 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             if not calc.is_finished_ok:
                 self.report("Wigner excitation failed :-(")
                 return self.exit_codes.ERROR_EXCITATION_FAILED
-
         all_wigner_data = [
             wc.outputs.excitations.get_dict() for wc in self.ctx.wigner_calcs
         ]
+        self.report("Wigner excitation sucessfull")
         self.out("wigner_excitations", List(all_wigner_data).store())
+        
+    def inspect_selected_excitations(self):
+        """Check whether all selected excitations succeeded"""
+        for calc in self.ctx.repsample_exc:
+            if not calc.is_finished_ok:
+                self.report("Selected geometry excitation failed :-(")
+                return self.exit_codes.ERROR_EXCITATION_FAILED
+
+        all_selected_data = [
+            wc.outputs.excitations.get_dict() for wc in self.ctx.repsample_exc
+        ]
+        self.report("Selected excitations successful")
+        self.out("selected_excitations", List(all_selected_data).store())
 
     def should_optimize(self):
         return self.inputs.optimize.value
@@ -276,6 +719,8 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
     def should_run_wigner(self):
         return self.should_optimize() and self.inputs.nwigner > 0
 
+    def should_run_repsample(self):
+         return self.inputs.rep_sample and self.inputs.nwigner > 0
 
 class AtmospecWorkChain(WorkChain):
     """The top-level ATMOSPEC workchain"""
@@ -288,21 +733,24 @@ class AtmospecWorkChain(WorkChain):
         super().define(spec)
         spec.expose_inputs(OrcaWignerSpectrumWorkChain, exclude=["structure"])
         spec.input("structure", valid_type=TrajectoryData)
-
         spec.output(
             "spectrum_data",
             valid_type=List,
             required=True,
             help="All data necessary to construct spectrum in SpectrumWidget",
         )
-
         spec.output(
             "relaxed_structures",
             valid_type=TrajectoryData,
             required=False,
             help="Minimized structures of all conformers",
         )
-
+        spec.output(
+            "repsample_results",
+            valid_type=Dict,
+            required=False,
+            help="agregated repsample results for each conformer.",
+        )
         spec.outline(
             cls.launch,
             cls.collect,
@@ -326,17 +774,16 @@ class AtmospecWorkChain(WorkChain):
 
         conf_outputs = [wc.outputs for wc in self.ctx.confs]
 
-        # Combine all spectra data
-        if self.inputs.optimize and self.inputs.nwigner > 0:
-            data = {
-                str(i): outputs.wigner_excitations
-                for i, outputs in enumerate(conf_outputs)
-            }
-        else:
-            data = {
-                str(i): [outputs.franck_condon_excitations.get_dict()]
-                for i, outputs in enumerate(conf_outputs)
-            }
+        # Modified data collection logic
+        data = {}
+        for i, outputs in enumerate(conf_outputs):
+            if "selected_excitations" in outputs:
+                data[str(i)] = outputs.selected_excitations
+            elif "wigner_excitations" in outputs:
+                data[str(i)] = outputs.wigner_excitations
+            else:
+                data[str(i)] = [outputs.franck_condon_excitations.get_dict()]
+
         all_results = run(ConcatInputsToList, ns=data)
         self.out("spectrum_data", all_results["output"])
 
@@ -357,3 +804,12 @@ class AtmospecWorkChain(WorkChain):
                 arrays=array_data, **relaxed_structures
             )
             self.out("relaxed_structures", trajectory)
+
+        repsample_data = {}
+        for idx, outputs in enumerate(conf_outputs):
+            if "repsample_results" in outputs:
+                repsample_data[f"c{idx}"] = outputs.repsample_results
+
+        if repsample_data:
+            aggregated = aggregate_repsample_results(**repsample_data)
+            self.out("repsample_results", aggregated)

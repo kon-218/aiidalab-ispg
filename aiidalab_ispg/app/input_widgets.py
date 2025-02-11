@@ -39,6 +39,7 @@ class ExcitedStateMethod(Enum):
     TDDFT = "TDDFT"
     CCSD = "EOM-CCSD"
     ADC2 = "ADC2"
+    ZINDO = "ZINDO/S"
 
 
 class MolecularGeometrySettings(ipw.VBox):
@@ -291,6 +292,106 @@ class WignerSamplingSettings(ipw.VBox):
     def reset(self):
         self.nwigner.value = self._NSAMPLES_DEFAULT
         self.wigner_low_freq_thr.value = self._LOW_FREQ_THR_DEFAULT
+
+
+class RepresentativeSamplingSettings(ipw.VBox):
+    disabled = tl.Bool(default=False)
+
+    title = ipw.HTML(
+        """<div style="padding-top: 0px; padding-bottom: 0px">
+        <h4>Representative Sampling</h4>
+        </div>"""
+    )
+
+    _NSAMPLES_DEFAULT = 10
+    _EXP_METHOD_DEFAULT = "ZIndo/S"
+    _NUM_CYCLES_DEFAULT = 100
+    _OPT_JOBS_DEFAULT = 10
+
+    def __init__(self):
+        style = {"description_width": "initial"}
+        layout = ipw.Layout(max_width="250px")
+
+        # Checkbox to enable/disable representative sampling
+        self.enable_rep_sampling = ipw.Checkbox(
+            value=False,
+            description="Enable Representative Sampling",
+            indent=False,
+            layout=layout,
+        )
+        self.enable_rep_sampling.observe(self._on_checkbox_toggle, "value")
+
+        # Representative Sampling settings
+        self.sample_size = ipw.IntText(
+            description="Reduced sample size",
+            value=self._NSAMPLES_DEFAULT,
+            style=style,
+            layout=layout,
+            disabled=True,  # Initially disabled
+        )
+
+        self.exploratory_method = ipw.Text(
+            description="Exp. method",
+            value=self._EXP_METHOD_DEFAULT,
+            style=style,
+            layout=layout,
+            disabled=True,  # Initially disabled
+        )
+        
+        self.num_cycles = ipw.IntText(
+            description="Number of annealing cycles",
+            value=self._NUM_CYCLES_DEFAULT,
+            style=style,
+            layout=layout,
+            disabled=True,  # Initially disabled
+        )
+        
+        self.opt_jobs = ipw.IntText(
+            description="Number of repetitions",
+            value=self._OPT_JOBS_DEFAULT,
+            style=style,
+            layout=layout,
+            disabled=True,  # Initially disabled
+        )
+
+        # Initialize the VBox with all widgets
+        super().__init__(
+            [
+                self.title,
+                self.enable_rep_sampling,
+                self.sample_size,
+                self.exploratory_method,
+                self.num_cycles,
+                self.opt_jobs,
+            ]
+        )
+
+    def _on_checkbox_toggle(self, change):
+        """Enable/disable widgets based on checkbox value."""
+        enabled = change["new"]
+        self.sample_size.disabled = not enabled
+        self.exploratory_method.disabled = not enabled
+        self.num_cycles.disabled = not enabled
+        self.opt_jobs.disabled = not enabled
+
+    @tl.observe("disabled")
+    def _observe_disabled(self, change):
+        """Globally enable/disable all widgets, including the checkbox."""
+        is_disabled = change["new"]
+        self.enable_rep_sampling.disabled = is_disabled
+        all_disabled = is_disabled or not self.enable_rep_sampling.value
+        self.sample_size.disabled = all_disabled
+        self.exploratory_method.disabled = all_disabled
+        self.num_cycles.disabled = all_disabled
+        self.opt_jobs.disabled = all_disabled
+
+    def reset(self):
+        """Reset all settings to their default values."""
+        self.num_cycles.value = self._NUM_CYCLES_DEFAULT
+        self.sample_size.value = self._NSAMPLES_DEFAULT
+        self.exploratory_method.value = self._EXP_METHOD_DEFAULT
+        self.opt_jobs.value = self._OPT_JOBS_DEFAULT
+        self.enable_rep_sampling.value = False  # Reset to unchecked
 
 
 class CodeSettings(ipw.VBox):

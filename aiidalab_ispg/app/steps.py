@@ -20,6 +20,7 @@ from aiidalab_widgets_base import (
 
 from .qeapp import StructureSelectionStep as QeAppStructureSelectionStep
 from .spectrum import EnergyUnit, Spectrum, SpectrumWidget
+from .spectrum_analysis import RepsampleAnalysisWidget
 from .utils import get_formula
 from .widgets import HeaderWarning, ISPGProcessNodesTreeWidget, spinner
 
@@ -347,6 +348,14 @@ class ViewSpectrumStep(ipw.VBox, WizardAppWidgetStep):
         else:
             equal_weight = 1.0 / nconf
             conformer_weights = [equal_weight for i in range(nconf)]
+        
+        # Check if reduced sampling data is available for spectrum
+        if 'selected_excitations' in process.outputs:
+            spectrum_data = process.outputs.selected_excitations.get_list()
+            nsample = len(spectrum_data)
+        else:
+            spectrum_data = process.outputs.spectrum_data.get_list()
+            nsample = process.inputs.nwigner.value if process.inputs.nwigner > 0 else 1
 
         conformer_transitions = [
             {
@@ -354,11 +363,21 @@ class ViewSpectrumStep(ipw.VBox, WizardAppWidgetStep):
                 "nsample": nsample,
                 "weight": conformer_weights[i],
             }
-            for i, conformer in enumerate(process.outputs.spectrum_data.get_list())
+            for i, conformer in enumerate(spectrum_data)
         ]
 
         self.spectrum.conformer_transitions = conformer_transitions
-
+        
+        # Handle RepSample results
+        repsample_data = {}
+        if 'repsample_results' in process.outputs:
+            print("repsample results")
+            repsample_data = process.outputs.repsample_results.get_dict()
+        
+        # Update analysis widget
+        self.spectrum.repsample_results = repsample_data 
+        print(repsample_data)
+                
         smiles = process.inputs.structure.base.extras.get("smiles", None)
         self.spectrum.smiles = smiles
         if smiles:

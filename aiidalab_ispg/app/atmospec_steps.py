@@ -9,7 +9,7 @@ import traitlets
 
 from aiida.engine import ProcessState, run_get_node, submit
 from aiida.manage import get_manager
-from aiida.orm import Bool, load_code, load_node
+from aiida.orm import Bool, Int, load_code, load_node
 from aiida.plugins import WorkflowFactory
 
 from .input_widgets import (
@@ -19,6 +19,7 @@ from .input_widgets import (
     GroundStateSettings,
     MolecularGeometrySettings,
     MoleculeSettings,
+    RepresentativeSamplingSettings,
     ResourceSelectionWidget,
     WignerSamplingSettings,
 )
@@ -39,6 +40,11 @@ class AtmospecParameters(OptimizationParameters):
     tddft_functional: str
     nwigner: int
     wigner_low_freq_thr: float
+    rep_sampling: bool
+    num_samples: int
+    exploratory_method: str
+    num_cycles: int
+    opt_jobs:int
 
 
 DEFAULT_ATMOSPEC_PARAMETERS = AtmospecParameters(
@@ -54,6 +60,11 @@ DEFAULT_ATMOSPEC_PARAMETERS = AtmospecParameters(
     tddft_functional="wB97X-D4",
     nwigner=0,
     wigner_low_freq_thr=100.0,
+    rep_sampling=True,
+    num_samples=10,
+    exploratory_method="ZINDO/S",
+    num_cycles=10,
+    opt_jobs=10,
 )
 
 
@@ -82,6 +93,8 @@ class SubmitAtmospecAppWorkChainStep(SubmitWorkChainStepBase):
 
         self.wigner_settings = WignerSamplingSettings()
 
+        self.repsample_settings = RepresentativeSamplingSettings()
+
         self.codes_selector = CodeSettings()
         self.resources_settings = ResourceSelectionWidget()
 
@@ -94,6 +107,7 @@ class SubmitAtmospecAppWorkChainStep(SubmitWorkChainStepBase):
             self.geometry_settings,
             self.ground_state_settings,
             self.wigner_settings,
+            self.repsample_settings,
             self.molecule_settings,
             self.excited_state_settings,
         ]
@@ -122,6 +136,7 @@ class SubmitAtmospecAppWorkChainStep(SubmitWorkChainStepBase):
         if self.codes_selector.orca.value is None:
             return False
         return True
+        
 
     def _wigner_allowed(self):
         # Do not allow Wigner sampling for EOM-CCSD
@@ -188,6 +203,11 @@ class SubmitAtmospecAppWorkChainStep(SubmitWorkChainStepBase):
         self.excited_state_settings.basis.value = parameters.es_basis
         self.wigner_settings.nwigner.value = parameters.nwigner
         self.wigner_settings.wigner_low_freq_thr.value = parameters.wigner_low_freq_thr
+        self.repsample_settings.enable_rep_sampling.value = parameters.rep_sampling
+        self.repsample_settings.num_cycles.value = parameters.num_cycles
+        self.repsample_settings.sample_size.value = parameters.num_samples
+        self.repsample_settings.exploratory_method.value = parameters.exploratory_method
+        self.repsample_settings.opt_jobs.value = parameters.opt_jobs
 
         # Infer the value of the gs_sync checkbox
         if (
@@ -200,6 +220,7 @@ class SubmitAtmospecAppWorkChainStep(SubmitWorkChainStepBase):
 
     def _get_parameters_from_ui(self) -> AtmospecParameters:
         """Prepare builder parameters from the UI input widgets"""
+        print(self.repsample_settings.enable_rep_sampling.value)
         return AtmospecParameters(
             optimize=self.geometry_settings.optimize.value,
             charge=self.molecule_settings.charge.value,
@@ -213,6 +234,11 @@ class SubmitAtmospecAppWorkChainStep(SubmitWorkChainStepBase):
             nstates=self.excited_state_settings.nstates.value,
             nwigner=self.wigner_settings.nwigner.value,
             wigner_low_freq_thr=self.wigner_settings.wigner_low_freq_thr.value,
+            rep_sampling=self.repsample_settings.enable_rep_sampling.value,
+            num_cycles=self.repsample_settings.num_cycles.value,
+            num_samples=self.repsample_settings.sample_size.value,
+            exploratory_method=self.repsample_settings.exploratory_method.value,
+            opt_jobs=self.repsample_settings.opt_jobs.value,
         )
 
     @traitlets.observe("process")
@@ -315,7 +341,22 @@ class SubmitAtmospecAppWorkChainStep(SubmitWorkChainStepBase):
             opt_params["input_keywords"].append(f"{basis}/C")
             opt_params["input_blocks"]["mp2"] = {"maxcore": MEMORY_PER_CPU}
         return opt_params
-
+    
+    def _add_zindo_orca_params(
+        self, base_orca_parameters, basis, method, nroots
+    ):            
+        zindo_params = deepcopy(base_orca_parameters)
+        zindo_params["input_keywords"].append(method)
+        zindo_params["input_blocks"]["method"] = {
+            "Method": "INDO",
+            "Version": "ZINDO_S",
+        }
+        zindo_params["input_blocks"]["cis"] = {
+            "nroots": nroots,
+            "maxcore": MEMORY_PER_CPU,
+        }
+        return zindo_params
+   
     def submit(self, _=None):
         assert self.input_structure is not None
 
@@ -349,11 +390,34 @@ class SubmitAtmospecAppWorkChainStep(SubmitWorkChainStepBase):
                 mdci_method=bp.excited_method,
                 nroots=bp.nstates,
             )
+        elif bp.excited_method in (
+            ExcitedStateMethod.ZINDO,
+        ):
+            es_parameters = self._add_zindo_orca_params(
+                base_orca_parameters,
+                basis=bp.es_basis,
+                method=bp.exploratory_method,
+                nroots=bp.nstates,
+            )
         else:
             msg = f"Excited method {bp.excited_method} not implemented"
             raise NotImplementedError(msg)
+            
+        # Repsample parameters if needed
+        exploratory_parameters = None
+        if bp.rep_sampling:
+            exploratory_parameters = self._add_zindo_orca_params(
+                base_orca_parameters,
+                basis="def2-SVP", # Use for now
+                method=bp.exploratory_method,
+                nroots=Int(1) # Fix later
+            )
+            builder.nsamples = Int(bp.num_samples)
+            builder.cycles = Int(bp.num_cycles)
+            builder.opt_jobs = Int(bp.opt_jobs)
 
         builder.optimize = bp.optimize
+        builder.rep_sample = Bool(bp.rep_sampling)
         builder.opt.orca.parameters = gs_opt_parameters
         builder.exc.orca.parameters = es_parameters
 
@@ -374,6 +438,14 @@ class SubmitAtmospecAppWorkChainStep(SubmitWorkChainStepBase):
         if bp.excited_method != ExcitedStateMethod.CCSD:
             builder.exc.orca.metadata.options.resources["tot_num_mpiprocs"] = 1
             builder.exc.orca.metadata.options.resources["num_mpiprocs_per_machine"] = 1
+        
+        if exploratory_parameters:    
+            builder.exp_exc.orca.parameters = exploratory_parameters
+            builder.exp_exc.orca.metadata = deepcopy(metadata)
+            builder.exp_exc.orca.metadata.options.resources["tot_num_mpiprocs"] = 1            
+            builder.exp_exc.orca.metadata.options.resources["num_mpiprocs_per_machine"] = 1
+            builder.exp_exc.clean_workfdir = Bool(True)
+            builder.exp_exc.orca.metadata.description = "ORCA exploratory ZINDO calculation"
 
         # Fetch GBW file from optimization step, to be used as a guess
         # for subsequent excited state calculations.
@@ -417,8 +489,9 @@ class AtmospecWorkflowStatus(enum.IntEnum):
     OPT = 1
     FC = 2
     WIGNER = 3
-    FINISHED = 4
-    FAILED = 5
+    REPSAMPLE = 4
+    FINISHED = 5
+    FAILED = 6
 
 
 class AtmospecWorkflowProgressWidget(ipw.HBox):
@@ -438,7 +511,7 @@ class AtmospecWorkflowProgressWidget(ipw.HBox):
             description="Workflow progress:",
             value=0,
             min=0,
-            max=4,
+            max=5,
             disabled=False,
             orientations="horizontal",
         )
@@ -463,6 +536,7 @@ class AtmospecWorkflowProgressWidget(ipw.HBox):
                     AtmospecWorkflowStatus.OPT: f"Optimizing conformers {spinner}",
                     AtmospecWorkflowStatus.FC: f"Computing Franck-Condon spectrum {spinner}",
                     AtmospecWorkflowStatus.WIGNER: f"Computing NEA spectrum {spinner}",
+                    AtmospecWorkflowStatus.REPSAMPLE: "Repsample started",
                     AtmospecWorkflowStatus.FINISHED: "Finished successfully! 🎉",
                     AtmospecWorkflowStatus.FAILED: "Failed! 😧",
                 }.get(status, status.name)
@@ -510,6 +584,8 @@ class ViewAtmospecAppWorkChainStatusAndResultsStep(ViewWorkChainStatusStep):
             return AtmospecWorkflowStatus.FC
         elif "optimization" in called_labels:
             return AtmospecWorkflowStatus.OPT
+        elif "repsample" in  called_labels:
+            return AtmospecWorkflowStatus.REPSAMPLE
         else:
             return AtmospecWorkflowStatus.INIT
 
