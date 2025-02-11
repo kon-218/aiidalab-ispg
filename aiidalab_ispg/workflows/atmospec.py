@@ -62,23 +62,68 @@ class OrcaExcitationWorkChain(OrcaBaseWorkChain):
             help="Excitation energies and oscillator strengths from a single-point excitations",
         )
 
-    def extract_transitions_from_orca_output(self, orca_output_params):
+    def extract_transitions_from_orca_output(self, orca_output_params, dipoles):
         return {
             "oscillator_strengths": orca_output_params["etoscs"],
             # Orca returns excited state energies in cm^-1
             # Perhaps we should do the conversion here,
             # to make this less ORCA specific.
             "excitation_energies_cm": orca_output_params["etenergies"],
-            "moments": orca_output_params["moments"]
+            "transition_dipoles": dipoles
         }
 
     @process_handler(exit_codes=ExitCode(0), priority=600)
     def add_excitation_output(self, calculation):
         """Extract excitation energies and osc. strengths into a separate output node"""
+        # Parse dipole moments from the output file
+        try:
+            retrieved = calculation.outputs.retrieved
+            dipole_moments = self.parse_dipole_moments(retrieved)
+        except Exception as e:
+            self.report(f"Failed to parse dipole moments: {str(e)}")
+            dipole_moments = []
+
         transitions = self.extract_transitions_from_orca_output(
-            calculation.outputs.output_parameters
+            calculation.outputs.output_parameters,
+            dipole_moments
         )
+
         self.out("excitations", Dict(transitions).store())
+        
+    def parse_dipole_moments(self, retrieved_folder):
+        """Parse TX, TY, TZ from the ORCA output file."""
+        import re
+
+        dipole_moments = []
+        output_filename = 'aiida.out'
+
+        try:
+            with retrieved_folder.open(output_filename, 'r') as f:
+                content = f.read()
+        except IOError:
+            self.report(f"Could not find {output_filename} in retrieved folder.")
+            return dipole_moments
+
+        lines = content.split('\n')
+        in_section = False
+        pattern = re.compile(r'^\s*\d+\s+\d+\.\d+\s+\d+\.\d+\s+\d+\.\d+\s+\d+\.\d+\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s*$')
+
+        for line in lines:
+            if 'ABSORPTION SPECTRUM VIA TRANSITION ELECTRIC DIPOLE MOMENTS' in line:
+                in_section = True
+                continue
+            if in_section:
+                if line.strip() == '':
+                    in_section = False
+                    continue
+                match = pattern.match(line)
+                if match:
+                    tx = float(match.group(1))
+                    ty = float(match.group(2))
+                    tz = float(match.group(3))
+                    dipole_moments.append((tx, ty, tz))
+
+        return dipole_moments
 
 
 @calcfunction
@@ -96,6 +141,7 @@ def parse_repsample_output(raw_output: SinglefileData) -> Dict:
     """Parse representative sampling output into structured data"""
     import re
     
+    # Empty data structure
     content = raw_output.get_content()
     parsed = {
         "options": {"cycles": None, "pdfcomp": None, "nsamples": None, "opt_jobs": None},
@@ -122,11 +168,12 @@ def parse_repsample_output(raw_output: SinglefileData) -> Dict:
         r"wall time (\d+) s": ("performance", "wall_time_s", int)
     }
 
+    # Fill data matching regex
     for line in content.split('\n'):
         for pattern, (section, key, conv) in patterns.items():
             if match := re.search(pattern, line):
                 parsed[section][key] = conv(match.group(1))
-                break  # Move to next line after match
+                break  
 
     return Dict(parsed)
 
@@ -166,6 +213,7 @@ class RepSampleWorkChain(WorkChain):
             cls.setup_calculation,
             cls.run_representative_sampling,
             cls.extract_geoms,
+            # cls.extract_pdfs
         )
         
         # Exit codes
@@ -357,9 +405,10 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             exclude=["orca.structure", "orca.code"],
         )
         spec.expose_inputs(
-            OrcaExcitationWorkChain, 
-            namespace="exp_exc", 
-            exclude=["orca.structure", "orca.code"]
+            OrcaExcitationWorkChain,
+            namespace="exp_exc",
+            exclude=["orca.structure", "orca.code"],
+            namespace_options={"required": False, "populate_defaults": False} 
         )
         spec.input("structure", valid_type=(StructureData, TrajectoryData))
         spec.input("code", valid_type=Code)
@@ -486,61 +535,46 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
         return ToContext(calc_exc=calc_exc)
 
     def repsample(self):
-        """Run representative sampling on excitation data using repre_sample_2D approach."""
-        self.report("Starting representative sampling")
+        """Prepare input file for repre_sample_2D using transition dipole moments."""
+        self.report("Setting up representative sampling calculation")
 
-        # Gather excitation data from all Wigner calculations
         excitation_data = []
-
-        for calc in self.ctx.wigner_calcs: # iterate over individual calculations
+        for calc in self.ctx.wigner_calcs: 
             if not calc.is_finished_ok:
                 self.report(f"Skipping failed Wigner calculation {calc.pk}")
                 continue
-                
-                
-            # Extract the excitation energies and oscillator strengths
-            data = calc.outputs.excitations.get_dict()
-            self.report(list(data.keys()))
-            energies = data["excitation_energies_cm"]
 
-            # Convert from cm^-1 to eV (1 cm^-1 = 1.23984193 × 10^-4 eV)
-            energies_ev = [e * 1.23984193e-4 for e in energies]
-            oscs = data["oscillator_strengths"]
-            moments = data["moments"][1:]
-            
-            # Add this geometry's data
-            excitation_data.append((energies_ev, moments))
+            data = calc.outputs.excitations.get_dict()
+            energies = data["excitation_energies_cm"]
+            energies_ev = [e * 1.23984193e-4 for e in energies]  # Convert cm^-1 to eV
+            dipoles = data["transition_dipoles"]
+
+            for energy, dipole in zip(energies_ev, dipoles):
+                excitation_data.append((energy, dipole))
 
         if not excitation_data:
             self.report("No valid excitation data available for representative sampling")
             return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
 
-        # Format data for representative sampling
-        input_data = []
-        for energies, moments in excitation_data:
-            for energy, moment in zip(energies, moments):
-                input_data.append((energy, moment))
-
         # Create inputs for RepSampleWorkChain
         inputs = {
-            "excitation_data": List(input_data).store(),
+            "excitation_data": List(excitation_data).store(),
+            #"n_samples": Int(len(excitation_data)),
             "n_samples": Int(1200),
-            "n_states": Int(1),  # Number of excited states
-            "sample_size": self.inputs.sample_size,  # Number of geometries to select
+            "n_states": Int(1),
+            "sample_size": self.inputs.sample_size,
             "cycles": self.inputs.cycles,
+            #"cores": self.inputs.cores,
             "cores": Int(1),
             "opt_jobs": self.inputs.opt_jobs,
-            "weight_by_significance": Bool(True),
-            "pdf_comparison": Str("KLdiv"),
+            #"pdf_comparison": self.inputs.pdf_comparison,
         }
 
-        # Submit the representative sampling calculation
         repsample_calc = self.submit(RepSampleWorkChain, **inputs)
-
         return ToContext(repsample_calc=repsample_calc)
 
     def inspect_repsample(self):
-        """Check and store parsed results"""
+        """Check and store parsed repsample results"""
         if not self.ctx.repsample_calc.is_finished_ok:
             return self.exit_codes.ERROR_REPRESENTATIVE_SAMPLING_FAILED
 
@@ -612,34 +646,6 @@ class OrcaWignerSpectrumWorkChain(WorkChain):
             inputs.orca.parameters = self.inputs.exp_exc.orca.parameters
             inputs = self.exposed_inputs(OrcaExcitationWorkChain, namespace="exp_exc", agglomerate=False) # Use exp_exc namespace
          
-        for i in self.ctx.wigner_structures.get_stepids():
-            inputs.orca.structure = pick_structure_from_trajectory(
-                self.ctx.wigner_structures, Int(i)
-            )
-            calc = self.submit(OrcaExcitationWorkChain, **inputs)
-            calc.label = f"wigner-excitation-{i}"
-            self.to_context(wigner_calcs=append_(calc))
-            
-    def wigner_excite(self):
-        """Calculate excited states for Wigner geometries."""
-        inputs = self.exposed_inputs(
-            OrcaExcitationWorkChain, namespace="exc", agglomerate=False
-        )
-        inputs.orca.code = self.inputs.code
-
-        # Pass in SCF wavefunction from minimum geometry
-        with self.ctx.calc_opt.outputs.retrieved.base.repository.open(
-            "aiida.gbw", "rb"
-        ) as handler:
-            gbw_file = SinglefileData(handler)
-            inputs.orca.file = {"gbw": gbw_file}
-        inputs.orca.parameters = add_orca_wf_guess(inputs.orca.parameters)
-
-        if self.inputs.rep_sample and self.inputs.exp_exc is not None:
-            # Use the exploratory method if representative sampling is enabled.
-            self.report("Using exploratory method for Wigner excitations")
-            inputs.orca.parameters = self.inputs.exp_exc.orca.parameters
-        
         for i in self.ctx.wigner_structures.get_stepids():
             inputs.orca.structure = pick_structure_from_trajectory(
                 self.ctx.wigner_structures, Int(i)
